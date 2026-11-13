@@ -190,6 +190,18 @@ Important values:
 
 `doctor` and `preflight` are read-only and safe at any time.
 
+## Git and the pre-commit gate
+
+- The repository is initialized (`main`); generated trees (`ComfyUI/`, `venv/`,
+  `logs/`, `output/`, `input/`, `temp/`, `user/`, `provision/.state/`) are
+  ignored.
+- Hooks are versioned in `.githooks/` and enabled with
+  `git config core.hooksPath .githooks`.
+- `.githooks/pre-commit` calls `./provision.sh test`, which runs `bash -n`,
+  `shellcheck`, `ruff format --check`, `ruff check`, `pyright` and `pytest`.
+  Keep that single entry point; do not duplicate the check list in the hook.
+  `git commit --no-verify` bypasses it when genuinely necessary.
+
 ## Safe workflow for agents
 
 1. Read this file and `provision/config/provision.env`; avoid reading generated
@@ -216,4 +228,5 @@ Important values:
 - No model files and no `~/.config/comfyui/civitai.token` yet; `models` is
   waiting for `auth`/`--set sft`.
 - `BIG` is mounted with ~889 GB free and is not in `/etc/fstab`.
-- No git repository is initialized in this directory.
+- Git repository initialized on `main` with the first commit; local identity is
+  `vlabe <vlabe@localhost>` and the pre-commit hook is active.
