@@ -40,6 +40,8 @@ def host_after_system(config, plan_obj):
     files = base_files(config)
     dirs = set(base_dirs(config))
     modes = {}
+    sizes = {}
+    swap = set()
     packages = set()
     sysctl = {"vm.max_map_count": 65530, "fs.inotify.max_user_watches": 8192}
     mounted = set()
@@ -59,13 +61,23 @@ def host_after_system(config, plan_obj):
         elif action.kind == "apt_install":
             packages.update(action.params["packages"])
         elif action.id == "sysctl-apply":
-            sysctl = dict(layout.SYSCTL_VALUES)
+            sysctl.update(layout.SYSCTL_VALUES)
+        elif action.id == "crash-sysctl":
+            sysctl.update(layout.CRASH_SYSCTL_VALUES)
         elif action.id == "mount-big":
             mounted.add(str(config.big_mount))
+        elif action.id == "swap-allocate":
+            sizes[str(config.swap_file)] = layout.parse_size(config.swap_size)
+        elif action.id == "swap-chmod":
+            modes[str(config.swap_file)] = "600"
+        elif action.id == "swap-on":
+            swap.add(str(config.swap_file))
     return FakeProbe(
         files=files,
         dirs=dirs,
         modes=modes,
+        sizes=sizes,
+        swap=swap,
         perms=base_perms(),
         listdir_map=base_listdir(config),
         packages=packages,
@@ -73,6 +85,9 @@ def host_after_system(config, plan_obj):
         sysctl=sysctl,
         mounted=mounted,
         session_groups=("vlabe",),
+        runner=FakeRunner(
+            [("blkid", RunResult(0, "swap\n", "")), ("systemctl is-enabled", RunResult(0, "static\n", ""))]
+        ),
     )
 
 

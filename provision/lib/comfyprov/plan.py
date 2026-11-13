@@ -203,6 +203,11 @@ class Planner:
             satisfied=not low and self.facts.file("sysctl") == layout.SYSCTL_CONTENT,
         )
 
+        if self.config.enable_crash_capture:
+            _crash_logging_actions(self, plan)
+        else:
+            plan.note("crash capture is disabled (ENABLE_CRASH_CAPTURE=0)")
+
         for path in _app_dirs(self.config):
             self.mkdir(plan, path)
         self.mkdir(plan, self.config.config_home, mode="700")
@@ -801,6 +806,81 @@ def _swap_actions(planner: Planner, plan: Plan) -> None:
             sudo=True,
             effect=EFFECT_BOOT,
         )
+    )
+
+
+def _crash_logging_actions(planner: Planner, plan: Plan) -> None:
+    """Durable logging: journald sync, fsync'd kernel copy, watchdog panics.
+
+    Part of the ``system`` step because it changes the machine's configuration,
+    which is exactly what provisioning is for.
+    """
+    facts = planner.facts
+    planner.write(
+        plan,
+        layout.JOURNALD_DROPIN,
+        layout.JOURNALD_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("journald"),
+    )
+
+    journald_ok = facts.file("journald") == layout.JOURNALD_CONTENT
+    planner.exec(
+        plan,
+        "journald-restart",
+        "Restart systemd-journald with the durable sync settings",
+        ["systemctl", "restart", "systemd-journald"],
+        sudo=True,
+        satisfied=journald_ok,
+    )
+
+    if "rsyslog" in facts.packages:
+        planner.write(
+            plan,
+            layout.RSYSLOG_DROPIN,
+            layout.RSYSLOG_CONTENT,
+            mode="644",
+            sudo=True,
+            current=facts.file("rsyslog"),
+        )
+        planner.exec(
+            plan,
+            "rsyslog-reload",
+            "Reload rsyslog (fsync'd kernel log copy)",
+            ["systemctl", "reload-or-restart", "rsyslog"],
+            sudo=True,
+            allow_fail=True,
+            satisfied=facts.file("rsyslog") == layout.RSYSLOG_CONTENT,
+        )
+    else:
+        plan.note("rsyslog is not installed; kernel messages only go through journald")
+
+    planner.write(
+        plan,
+        layout.CRASH_SYSCTL_FILE,
+        layout.CRASH_SYSCTL_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("crash_sysctl"),
+    )
+    wrong = {name: value for name, value in layout.CRASH_SYSCTL_VALUES.items() if facts.sysctl.get(name) != value}
+    planner.exec(
+        plan,
+        "crash-sysctl",
+        "Apply watchdog and panic settings",
+        ["sysctl", "--system"],
+        sudo=True,
+        satisfied=not wrong and facts.file("crash_sysctl") == layout.CRASH_SYSCTL_CONTENT,
+    )
+    planner.exec(
+        plan,
+        "pstore-collect",
+        "Collect firmware crash records after a reset",
+        ["systemctl", "enable", "--now", layout.PSTORE_UNIT],
+        sudo=True,
+        allow_fail=True,
+        satisfied=facts.pstore_enabled,
     )
 
 

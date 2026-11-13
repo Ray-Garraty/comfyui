@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 
-from . import layout, models
+from . import crashlog, layout, models
 from .actions import EXIT_OK, EXIT_PREREQ
 from .config import Config
 from .facts import Facts
@@ -198,4 +198,5 @@ def doctor(config: Config, facts: Facts, probe: Probe, client: HttpClient | None
     except (HttpError, ValueError):
         findings.append(Finding(WARN, "server", "not running"))
 
+    findings.extend(crashlog.findings(config, probe))
     return findings

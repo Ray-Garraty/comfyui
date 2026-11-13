@@ -52,6 +52,7 @@ comfyprov/gpu.py       gfx parsing from KFD, group/permission logic
 comfyprov/facts.py     single snapshot of the machine
 comfyprov/plan.py      all step planners + status/reboot classification
 comfyprov/checks.py    preflight + doctor
+comfyprov/crashlog.py  crash evidence (pstore, previous boot) + host snapshots
 comfyprov/server.py    HTTP helpers (stats, manager, history)
 comfyprov/smoke.py     MOSS workflow + PNG validation
 comfyprov/gpucheck.py  PyTorch/ROCm matmul check (runs in the venv)
@@ -89,6 +90,8 @@ shipping.
 provision.sh                     # command dispatcher, lock, step runner
 start-comfyui.sh                 # launcher (mount, group re-exec, env, exec)
 pyproject.toml                   # ruff / pyright / pytest configuration
+tools/crashlab/                  # standalone crash forensics (read-only, stdlib only)
+.agents/skills/crash-forensics/  # SKILL.md: how to investigate a crash
 provision/
 ├── lib/common.sh                # executor, logging, sudo, downloads
 ├── lib/comfyprov/               # business logic (see above)
@@ -106,6 +109,10 @@ Generated at provisioning time (do not edit by hand):
 - `ComfyUI/models` — symlink to `MODELS_DIR`.
 - `~/.config/comfyui/` — tokens and configs, mode 700/600.
 - `~/.local/share/applications/comfyui.desktop`, optional `~/Desktop` copy.
+- `/etc/systemd/journald.conf.d/99-comfyui.conf`,
+  `/etc/rsyslog.d/49-comfyui-crash.conf`,
+  `/etc/sysctl.d/99-comfyui-crash.conf` — durable logging and crash capture,
+  written by the `system` step (see "Logging and crash capture" below).
 
 ## Commands
 
@@ -171,6 +178,13 @@ file with the same precedence; never duplicate defaults in Python or bash.
 Important values:
 
 - `COMFYUI_REF=v0.45.3`, `MANAGER_REF=4.3` (ComfyUI ≥ 0.42 has native MOSS-Image).
+- `COMFYUI_RESERVE_VRAM=1.5` — 12 GB VRAM is shared with the desktop; without
+  the reserve the kernel logs `Failed to pin framebuffer with error -12`.
+- `ENABLE_SWAP=1`, `SWAP_SIZE=16G`, `SWAP_FILE=/swapfile` — swap is part of
+  every `all` run; ComfyUI may pin up to 16 GiB of host memory.
+- `COMFYUI_LOG_LEVEL=INFO`, `COMFYUI_DEBUG_LOG=1` (second DEBUG log file),
+  `LOG_SYNC_INTERVAL=5` (seconds between `sync -f` calls on the log files),
+  `ENABLE_CRASH_CAPTURE=1` (journald/rsyslog/watchdog/pstore step).
 - `TORCH_VERSION=2.13.0`, `TORCHVISION_VERSION=0.28.0`,
   `TORCHAUDIO_VERSION=2.11.0.2`, `ROCM_VERSION=10.1.0`, index
   `https://stable.repo.amd.com/rocm/whl-next/`.
@@ -190,6 +204,46 @@ Important values:
   (Manager returns plain text).
 
 `doctor` and `preflight` are read-only and safe at any time.
+
+## Logging and crash capture
+
+This machine hard-reset four times in one day with nothing useful on disk. The
+rule now: every log front writes to a file and reaches the platter quickly.
+
+Runtime (user level, no sudo):
+
+- `logs/comfyui.log` — ComfyUI `INFO`, `logs/comfyui-debug.log` — `DEBUG`
+  (`--verbose` is passed twice), `logs/comfyui-server.log` — console mirror of
+  the launcher, `logs/session.log` — memory/VRAM snapshots, `logs/generate.log`
+  — generator, `logs/comfyui-start.log` — output of a server started by
+  `generate.sh` (never `/tmp`: tmpfs loses it on a reset).
+- `py snapshot` (`comfyprov.crashlog.snapshot`) prints RSS/swap/load plus
+  `mem_info_vram_*` and `mem_info_gtt_*`; the launcher and the generator append
+  it to their logs at start and at exit.
+- `start-comfyui.sh` and `generate.sh` run a `sync -f <log files>` loop every
+  `LOG_SYNC_INTERVAL` seconds; the loop exits when its parent process is gone.
+- `PYTHONFAULTHANDLER=1` is exported so a native crash prints a traceback.
+
+System level (part of the `system` step, needs sudo):
+
+- `/etc/systemd/journald.conf.d/99-comfyui.conf` — persistent journal,
+  `SyncIntervalSec=1`, no rate limiting (the default 5 min flush is what lost
+  the last lines before every reset).
+- `/etc/rsyslog.d/49-comfyui-crash.conf` — `$ActionFileEnableSync on` plus a
+  dedicated `/var/log/comfyui-kernel.log`.
+- `/etc/sysctl.d/99-comfyui-crash.conf` — `kernel.hardlockup_panic=1`,
+  `softlockup_panic=1`, `hung_task_panic=1`, `panic_on_oops=1`, `panic=10`,
+  watchdogs on, `printk_devkmsg=on`. A frozen desktop then panics and reboots
+  instead of hanging silently; the tail lands in the journal.
+- `systemd-pstore` collects firmware/ramoops records left by a reset.
+
+Reading the evidence: `./tools/crashlab/crashlab report` (see
+`.agents/skills/crash-forensics/SKILL.md`) prints a cause, the evidence lines,
+the signature counts of the last three boots, launcher sessions, core dumps with
+a decoded signal and `blame`, and the newest log tails. `crashlab` is
+deliberately independent of `provision/` and the venv: it must work when the
+things it investigates are broken. It never writes to the machine beyond an
+optional `--out FILE`.
 
 ## Git and the pre-commit gate
 

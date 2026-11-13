@@ -277,6 +277,14 @@ class Config:
         return self.get("COMFYUI_LOG_LEVEL", "INFO")
 
     @property
+    def debug_log(self) -> bool:
+        return self.boolean("COMFYUI_DEBUG_LOG", True)
+
+    @property
+    def log_sync_interval(self) -> int:
+        return self.integer("LOG_SYNC_INTERVAL", 5)
+
+    @property
     def extra_args(self) -> tuple[str, ...]:
         raw = self.get("COMFYUI_EXTRA_ARGS", "")
         return tuple(part for part in raw.split() if part)
@@ -289,6 +297,10 @@ class Config:
     @property
     def create_desktop_icon(self) -> bool:
         return self.boolean("CREATE_DESKTOP_ICON")
+
+    @property
+    def enable_crash_capture(self) -> bool:
+        return self.boolean("ENABLE_CRASH_CAPTURE", True)
 
     @property
     def enable_swap(self) -> bool:
@@ -335,8 +347,11 @@ _REQUIRED = (
     "COMFYUI_RESERVE_VRAM",
     "COMFYUI_LOWVRAM",
     "COMFYUI_LOG_LEVEL",
+    "COMFYUI_DEBUG_LOG",
+    "LOG_SYNC_INTERVAL",
     "INSTALL_MANAGER",
     "CREATE_DESKTOP_ICON",
+    "ENABLE_CRASH_CAPTURE",
     "ENABLE_SWAP",
     "SWAP_SIZE",
     "SWAP_FILE",
@@ -384,9 +399,14 @@ def validate(config: Config) -> None:
             raise ConfigError(f"{key} must not be empty")
 
     config.boolean("COMFYUI_LOWVRAM")
+    config.boolean("COMFYUI_DEBUG_LOG")
     config.boolean("INSTALL_MANAGER")
     config.boolean("CREATE_DESKTOP_ICON")
+    config.boolean("ENABLE_CRASH_CAPTURE")
     config.boolean("ENABLE_SWAP")
+
+    if config.log_sync_interval < 0:
+        raise ConfigError(f"LOG_SYNC_INTERVAL must be >= 0 (got {config.log_sync_interval})")
 
 
 def load(path: str | Path | None = None, environ: Mapping[str, str] | None = None) -> Config:

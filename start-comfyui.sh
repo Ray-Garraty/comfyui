@@ -201,6 +201,9 @@ export TORCH_HOME=${TORCH_HOME:-$MODELS_DIR/.cache/torch}
 export HF_HUB_DISABLE_TELEMETRY=1
 export DO_NOT_TRACK=1
 export PYTHONUNBUFFERED=1
+# A Python-level segfault/abort then prints the C traceback to stderr (and thus
+# into the log files) instead of dying silently.
+export PYTHONFAULTHANDLER=1
 
 if [[ "$DRY_RUN" != "1" ]]; then
     mkdir -p "$HF_HOME" "$TORCH_HOME"
@@ -210,11 +213,19 @@ fi
 # Log rotation
 # ---------------------------------------------------------------------------
 LOG_FILE="$LOG_DIR/comfyui.log"
-if [[ "$DRY_RUN" != "1" && -f "$LOG_FILE" ]]; then
-    log_size=$(file_size "$LOG_FILE")
-    if (( log_size > 20 * 1024 * 1024 )); then
-        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
-    fi
+DEBUG_LOG="$LOG_DIR/comfyui-debug.log"
+SERVER_LOG="$LOG_DIR/comfyui-server.log"
+SESSION_LOG="$LOG_DIR/session.log"
+if [[ "$DRY_RUN" != "1" ]]; then
+    mkdir -p "$LOG_DIR"
+    for log_file in "$LOG_FILE" "$DEBUG_LOG"; do
+        if [[ -f "$log_file" ]]; then
+            log_size=$(file_size "$log_file")
+            if (( log_size > 20 * 1024 * 1024 )); then
+                mv -f "$log_file" "$log_file.1" 2>/dev/null || true
+            fi
+        fi
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -243,6 +254,12 @@ CMD=(
     --disable-auto-launch
     --verbose "$LOG_LEVEL" "$LOG_FILE"
 )
+
+# A second, more verbose log file: DEBUG goes only there, so the main log stays
+# readable while a crash still has the detailed decisions around it.
+if [[ "${COMFYUI_DEBUG_LOG:-1}" == "1" ]]; then
+    CMD+=(--verbose DEBUG "$DEBUG_LOG")
+fi
 
 if [[ "$LOWVRAM" == "1" ]]; then
     CMD+=(--lowvram)
@@ -296,5 +313,40 @@ else
     log "Browser auto-open disabled. Open $PORT_URL manually."
 fi
 
+# ---------------------------------------------------------------------------
+# Durable logging: every front writes to a file that is flushed as it goes
+# ---------------------------------------------------------------------------
+# Host state at launch (memory, VRAM/GTT) so a crash is not a black box.
+{
+    printf '\n--- session %s (pid %s) ---\n' "$(date --iso-8601=seconds)" "$$"
+    py snapshot 2>/dev/null || true
+    printf '  reserve-vram=%s lowvram=%s log-level=%s\n' "$RESERVE_VRAM" "$LOWVRAM" "$LOG_LEVEL"
+} >>"$SESSION_LOG" 2>/dev/null || true
+
+# The console output used to live only in the terminal (or in /tmp, which is
+# tmpfs and loses everything on a hard reset). Mirror it into the log dir.
+if [[ ! -t 1 ]]; then
+    exec > >(tee -a "$SERVER_LOG") 2>&1
+fi
+
+# Force the log files to disk every few seconds: the page cache is exactly what
+# the last crash lost. The loop exits as soon as the server process is gone.
+SYNC_INTERVAL=${LOG_SYNC_INTERVAL:-5}
+if (( SYNC_INTERVAL > 0 )) && command -v sync >/dev/null 2>&1; then
+    (
+        # Do not inherit unrelated descriptors (for example the generator's
+        # instance lock) into a long-lived sync loop.
+        exec 9>&- 2>/dev/null || true
+        while sleep "$SYNC_INTERVAL"; do
+            kill -0 "$$" 2>/dev/null || exit 0
+            sync -f "$LOG_FILE" "$DEBUG_LOG" "$SERVER_LOG" "$SESSION_LOG" 2>/dev/null || true
+        done
+    ) &
+    disown 2>/dev/null || true
+fi
+
 cd "$COMFYUI_DIR"
+if command -v stdbuf >/dev/null 2>&1 && [[ ! -t 1 ]]; then
+    exec stdbuf -oL -eL "${CMD[@]}"
+fi
 exec "${CMD[@]}"

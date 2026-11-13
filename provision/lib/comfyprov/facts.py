@@ -67,6 +67,8 @@ class Facts:
     swap_active: frozenset[str]
     fstab: str
     desktop_shortcut: Path
+    pstore: tuple[str, ...]
+    pstore_enabled: bool
 
     # -- helpers -------------------------------------------------------------
     def group(self, name: str) -> gpu.GroupFact | None:
@@ -189,12 +191,17 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
     models_free = probe.free_bytes(config.big_mount)
     big_mounted = probe.is_mounted(config.big_mount)
 
-    sysctl = probe.sysctl_values(layout.SYSCTL_VALUES)
+    sysctl = probe.sysctl_values({**layout.SYSCTL_VALUES, **layout.CRASH_SYSCTL_VALUES})
     state = config.state_dir
     stamps = {name: probe.read_text(state / filename) for name, filename in layout.STAMPS.items()}
     shortcut = desktop_shortcut(probe)
+    pstore_state = probe.run(["systemctl", "is-enabled", layout.PSTORE_UNIT], timeout=15)
+    pstore_enabled = pstore_state.ok and pstore_state.out.strip() in layout.PSTORE_ENABLED_STATES
     files = {
         "sysctl": probe.read_text(layout.SYSCTL_FILE),
+        "crash_sysctl": probe.read_text(layout.CRASH_SYSCTL_FILE),
+        "journald": probe.read_text(layout.JOURNALD_DROPIN),
+        "rsyslog": probe.read_text(layout.RSYSLOG_DROPIN),
         "udev": probe.read_text(layout.UDEV_FILE),
         "constraints": probe.read_text(state / "constraints.txt"),
         "icon": probe.read_text(config.icon_path),
@@ -250,6 +257,8 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
         swap_active=probe.swap_active(),
         fstab=probe.read_text("/etc/fstab") or "",
         desktop_shortcut=shortcut,
+        pstore=tuple(probe.listdir(layout.PSTORE_DIR)),
+        pstore_enabled=pstore_enabled,
     )
 
 

@@ -52,6 +52,35 @@ log "Models dir: $DIFF_DIR"
 log "Output dir: $OUTPUT_DIR"
 log "Log file: $LOG_FILE"
 
+# Host state (memory, VRAM/GTT) before the server starts and after it stops:
+# written by Python so this script stays plumbing only.
+{
+    py snapshot 2>/dev/null || true
+} >>"$LOG_FILE" 2>/dev/null || true
+
+# The log file is the only place where a crash before the first prompt leaves
+# traces, so flush it to disk while we run instead of waiting for exit.
+SYNC_INTERVAL=${LOG_SYNC_INTERVAL:-5}
+SYNC_LOOP_PID=""
+if (( SYNC_INTERVAL > 0 )) && command -v sync >/dev/null 2>&1; then
+    (
+        # The subshell must not keep the instance lock (fd 9) or the log fd (3)
+        # alive after this script exits.
+        exec 9>&- 3>&-
+        while sleep "$SYNC_INTERVAL"; do
+            kill -0 "$$" 2>/dev/null || exit 0
+            sync -f "$LOG_FILE" 2>/dev/null || true
+        done
+    ) &
+    SYNC_LOOP_PID=$!
+fi
+stop_sync_loop() {
+    if [[ -n "$SYNC_LOOP_PID" ]]; then
+        kill "$SYNC_LOOP_PID" 2>/dev/null || true
+    fi
+}
+trap stop_sync_loop EXIT
+
 # ---------------------------------------------------------------------------
 # Prerequisites
 # ---------------------------------------------------------------------------
@@ -69,7 +98,9 @@ comfyui_ready() {
 
 if ! comfyui_ready; then
     warn "ComfyUI is not running at $API. Starting it (--no-browser)..."
-    "$INSTALL_DIR/start-comfyui.sh" --no-browser >/tmp/comfyui-generate.log 2>&1 &
+    # Not /tmp: tmpfs loses the whole startup log on a hard reset.
+    # fd 9 is this script's instance lock; the child must not keep it alive.
+    "$INSTALL_DIR/start-comfyui.sh" --no-browser >"$LOG_DIR/comfyui-start.log" 2>&1 9>&- &
     COMFYUI_PID=$!
     COMFYUI_WAS_STARTED=1
     for _ in $(seq 1 180); do
@@ -79,7 +110,7 @@ if ! comfyui_ready; then
         fi
         sleep 1
     done
-    comfyui_ready || die "ComfyUI did not become ready. Check /tmp/comfyui-generate.log"
+    comfyui_ready || die "ComfyUI did not become ready. Check $LOG_DIR/comfyui-start.log"
 else
     ok "ComfyUI already running at $API"
     COMFYUI_WAS_STARTED=0
@@ -105,16 +136,21 @@ PY_ARGS=(
     "${MODELS[@]}"
 )
 
-# Python output: stdout+stderr go to log file (fd 3) with timestamp and
-# to terminal. stdin stays connected to terminal, so interactive Python
-# prompts (Select [1-1]:, Prompt: etc.) work.
+# Business requirement: no delay after the user presses Enter at interactive
+# prompts (Select [1-1]:, Prompt: ...).  Python stdout stays connected to the
+# terminal (no process-substitution pipe), so prompts appear instantly.
+# python3 -u = unbuffered output.  The log file is written from inside Python
+# (GENERATE_LOG_FILE), not from a shell pipe.
 set +e
-python3 -m comfyprov.generate "${PY_ARGS[@]}" > >(while IFS= read -r line; do
-    printf '%s\n' "$line"
-    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line" >&3
-done) 2>&1
+export GENERATE_LOG_FILE="$LOG_FILE"
+python3 -u -m comfyprov.generate "${PY_ARGS[@]}" 2>&1
 PY_EXIT=$?
 set -e
+
+{
+    printf '%s generate.sh finished with exit %s\n' "$(date --iso-8601=seconds)" "$PY_EXIT"
+    py snapshot 2>/dev/null || true
+} >>"$LOG_FILE" 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Graceful exit of ComfyUI if we started it

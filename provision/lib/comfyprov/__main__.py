@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import auth, checks, models, report
+from . import auth, checks, crashlog, models, report
 from . import facts as facts_module
 from . import plan as plan_module
 from . import verify as verify_module
@@ -60,6 +60,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
     doctor_cmd = sub.add_parser("doctor", help="print diagnostics")
     doctor_cmd.add_argument("--json", action="store_true")
+
+    sub.add_parser("snapshot", help="print a one-shot memory/GPU state snapshot for the logs")
 
     verify_cmd = sub.add_parser("verify", help="check a running ComfyUI")
     verify_cmd.add_argument("--url", required=True)
@@ -167,6 +169,11 @@ def _cmd_doctor(args) -> int:
         print(json.dumps([item.to_dict() for item in findings], indent=2))
     else:
         print("\n".join(item.render() for item in findings))
+    return EXIT_OK
+
+
+def _cmd_snapshot(_args) -> int:
+    print(crashlog.snapshot(Probe()))
     return EXIT_OK
 
 
@@ -327,6 +334,7 @@ _HANDLERS = {
     "status": _cmd_status,
     "preflight": _cmd_preflight,
     "doctor": _cmd_doctor,
+    "snapshot": _cmd_snapshot,
     "verify": _cmd_verify,
     "gpucheck": _cmd_gpucheck,
     "auth": _cmd_auth,

@@ -87,6 +87,61 @@ SYSCTL_CONTENT = "# ComfyUI / large safetensors models\n" + "".join(
     f"{key} = {value}\n" for key, value in SYSCTL_VALUES.items()
 )
 
+# ---------------------------------------------------------------------------
+# Durable logging and crash capture
+#
+# A hard reset loses everything that still sits in the page cache. These three
+# files make the last minutes of a crash reach the disk and turn a kernel
+# lockup into a panic (which reboots and leaves the tail in the journal).
+# ---------------------------------------------------------------------------
+JOURNALD_DROPIN = Path("/etc/systemd/journald.conf.d/99-comfyui.conf")
+JOURNALD_CONTENT = """# ComfyUI / durable journal for crash analysis
+# The default SyncIntervalSec=5min lost the last minutes of kernel messages
+# before every crash on this machine. Sync every second, never rate limit.
+[Journal]
+Storage=persistent
+SyncIntervalSec=1
+RateLimitIntervalSec=0
+RateLimitBurst=0
+SystemMaxUse=2G
+SystemKeepFree=1G
+"""
+
+RSYSLOG_DROPIN = Path("/etc/rsyslog.d/49-comfyui-crash.conf")
+RSYSLOG_CONTENT = """# ComfyUI / synchronous copy of kernel messages
+# fsync after every write so the lines written right before a reset survive.
+$ActionFileEnableSync on
+$FileCreateMode 0640
+$DirCreateMode 0750
+kern.* /var/log/comfyui-kernel.log
+"""
+
+CRASH_SYSCTL_FILE = Path("/etc/sysctl.d/99-comfyui-crash.conf")
+CRASH_SYSCTL_VALUES: dict[str, int] = {
+    "kernel.nmi_watchdog": 1,
+    "kernel.watchdog": 1,
+    "kernel.hardlockup_panic": 1,
+    "kernel.softlockup_panic": 1,
+    "kernel.hung_task_panic": 1,
+    "kernel.hung_task_timeout_secs": 60,
+    "kernel.panic_on_oops": 1,
+    "kernel.panic": 10,
+}
+# String-valued keys cannot live in CRASH_SYSCTL_VALUES (it is int-typed and
+# compared against /proc/sys), so they are appended to the file verbatim.
+CRASH_SYSCTL_CONTENT = (
+    "# ComfyUI / crash capture\n"
+    "# A hard lockup freezes the box without any log line. Panic instead: the\n"
+    "# tail is then written to the journal and (with kdump) to a dump.\n"
+    + "".join(f"{key} = {value}\n" for key, value in CRASH_SYSCTL_VALUES.items())
+    + "# Do not rate limit kernel messages to user space.\nkernel.printk_devkmsg = on\n"
+)
+
+PSTORE_DIR = Path("/sys/fs/pstore")
+PSTORE_UNIT = "systemd-pstore.service"
+PSTORE_ENABLED_STATES = ("enabled", "enabled-runtime", "static", "indirect")
+KERNEL_LOG_COPY = Path("/var/log/comfyui-kernel.log")
+
 UDEV_FILE = Path("/etc/udev/rules.d/99-comfyui-amd.rules")
 UDEV_RULE_MARKER = "ComfyUI / ROCm"
 UDEV_CONTENT = """# ComfyUI / ROCm access to AMD compute and render nodes

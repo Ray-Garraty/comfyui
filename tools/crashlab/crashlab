@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# crashlab - standalone crash-forensics entry point (read-only).
+#
+#   ./tools/crashlab/crashlab report [--boot -1] [--json] [--out FILE]
+#   ./tools/crashlab/crashlab boots
+#   ./tools/crashlab/crashlab timeline
+#   ./tools/crashlab/crashlab coredump [PID] [--bt]
+#   ./tools/crashlab/crashlab snapshot
+#   ./tools/crashlab/crashlab self-test
+#
+# Needs python3 only. No venv, no sudo, no dependency on provision/.
+set -Eeuo pipefail
+
+HERE=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd)
+exec env PYTHONPATH="$HERE/lib${PYTHONPATH:+:$PYTHONPATH}" PYTHONDONTWRITEBYTECODE=1 \
+    python3 -m crashlab "$@"
