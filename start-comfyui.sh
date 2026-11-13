@@ -1,0 +1,300 @@
+#!/usr/bin/env bash
+# start-comfyui.sh - launch ComfyUI with the settings prepared by provision.sh.
+#
+# Examples:
+#   ./start-comfyui.sh                 # localhost:8188, opens the browser
+#   ./start-comfyui.sh --no-browser    # keep the terminal free of browser windows
+#   ./start-comfyui.sh --lowvram       # if 12 GB VRAM is not enough
+#   ./start-comfyui.sh --port 8189     # explicit port
+#   ./start-comfyui.sh --dry-run       # print the command and environment
+#   ./start-comfyui.sh -- --use-sage-attention   # extra ComfyUI flags
+set -Eeuo pipefail
+
+SCRIPT_PATH=$(readlink -f -- "${BASH_SOURCE[0]}")
+SCRIPT_DIR=$(cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+
+# shellcheck source=provision/lib/common.sh
+source "$SCRIPT_DIR/provision/lib/common.sh"
+# shellcheck source=provision/config/provision.env
+source "$SCRIPT_DIR/provision/config/provision.env"
+
+PORT=${COMFYUI_PORT}
+PORT_EXPLICIT=0
+OPEN_BROWSER=1
+DO_MOUNT=1
+ALLOW_SG=1
+LOWVRAM=${COMFYUI_LOWVRAM}
+CPU_ONLY=0
+DRY_RUN=0
+RESERVE_VRAM=${COMFYUI_RESERVE_VRAM}
+LOG_LEVEL=${COMFYUI_LOG_LEVEL}
+EXTRA_ARGS=()
+ORIGINAL_ARGS=("$@")
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [options] [-- comfyui args...]
+
+Options:
+  --port N          Listen port (default: $PORT)
+  --lowvram         Enable ComfyUI --lowvram (low VRAM mode)
+  --cpu             Force CPU mode (useful for debugging only)
+  --no-browser      Do not open the web UI in a browser
+  --no-mount        Do not try to mount the BIG disk automatically
+  --no-sg           Do not re-exec through 'sg render'
+  --reserve-vram N  VRAM in GB reserved for the OS (default: $RESERVE_VRAM)
+  --log-level LVL   ComfyUI log level for the log file (default: $LOG_LEVEL)
+  --dry-run         Show the final command instead of running it
+  -h, --help        Show this help
+
+Environment overrides: COMFYUI_PORT, COMFYUI_LOWVRAM, COMFYUI_RESERVE_VRAM.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --port)          [[ $# -ge 2 ]] || die "--port requires a value"; PORT=$2; PORT_EXPLICIT=1; shift 2 ;;
+        --lowvram)       LOWVRAM=1; shift ;;
+        --cpu)           CPU_ONLY=1; shift ;;
+        --no-browser)    OPEN_BROWSER=0; shift ;;
+        --no-mount)      DO_MOUNT=0; shift ;;
+        --no-sg)         ALLOW_SG=0; shift ;;
+        --reserve-vram)  [[ $# -ge 2 ]] || die "--reserve-vram requires a value"; RESERVE_VRAM=$2; shift 2 ;;
+        --log-level)     [[ $# -ge 2 ]] || die "--log-level requires a value"; LOG_LEVEL=$2; shift 2 ;;
+        --dry-run)       DRY_RUN=1; shift ;;
+        -h|--help)       usage; exit 0 ;;
+        --)              shift; EXTRA_ARGS=("$@"); break ;;
+        *)               die "Unknown option: $1 (use -- to pass extra ComfyUI flags)" ;;
+    esac
+done
+
+export DRY_RUN
+
+# ---------------------------------------------------------------------------
+# Installation checks
+# ---------------------------------------------------------------------------
+[[ -x "$VENV_DIR/bin/python" ]] || {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        warn "Virtual environment not found at $VENV_DIR (run ./provision.sh all first)."
+    else
+        die "Virtual environment not found at $VENV_DIR. Run ./provision.sh all first."
+    fi
+}
+[[ -f "$COMFYUI_DIR/main.py" ]] || {
+    if [[ "$DRY_RUN" == "1" ]]; then
+        warn "ComfyUI not found at $COMFYUI_DIR (run ./provision.sh comfyui first)."
+    else
+        die "ComfyUI not found at $COMFYUI_DIR. Run ./provision.sh comfyui first."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Disk
+# ---------------------------------------------------------------------------
+if [[ "$DO_MOUNT" == "1" ]]; then
+    ensure_big_mount
+elif ! mountpoint -q "$BIG_MOUNT" 2>/dev/null; then
+    die "BIG is not mounted at $BIG_MOUNT (started with --no-mount)."
+fi
+if [[ "$DRY_RUN" != "1" ]]; then
+    [[ -d "$MODELS_DIR" ]] || die "Models directory is missing: $MODELS_DIR. Run ./provision.sh all first."
+    [[ -w "$MODELS_DIR" ]] || die "Models directory is not writable: $MODELS_DIR"
+    mkdir -p "$LOG_DIR" "$OUTPUT_DIR" "$INPUT_DIR" "$TEMP_DIR" "$USER_DIR" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# GPU access: the decision comes from the Python facts, the re-exec from bash
+# ---------------------------------------------------------------------------
+if [[ "$CPU_ONLY" == "0" ]]; then
+    [[ -e /dev/kfd ]] || die "/dev/kfd not found. The amdgpu kernel driver is not loaded."
+    [[ "$(id -u)" -ne 0 ]] || die "Do not run ComfyUI as root. Run it as $USER."
+
+    eval "$(py start-check)"
+    if [[ "${KFD_ACCESS:-0}" != "1" ]]; then
+        if [[ "$DRY_RUN" == "1" || "$ALLOW_SG" == "0" || "${COMFYUI_NEWSESSION:-0}" == "1" ]]; then
+            warn "No access to /dev/kfd in this session."
+        elif [[ "${IN_DB:-0}" == "1" && -x /usr/bin/sg ]]; then
+            # /usr/bin/sg is the newgrp symlink. /usr/local/bin/sg may be
+            # ast-grep, so never rely on PATH here.
+            log "Re-executing through '/usr/bin/sg render' to pick up the render group..."
+            shell_quote() {
+                printf "'%s'" "${1//\'/\'\\\'\'}"
+            }
+            quoted_cmd=$(shell_quote "$SCRIPT_PATH")
+            for arg in "${ORIGINAL_ARGS[@]}"; do
+                quoted_cmd+=" $(shell_quote "$arg")"
+            done
+            export COMFYUI_NEWSESSION=1
+            exec /usr/bin/sg render -c "exec $quoted_cmd"
+        else
+            die "You are not in the 'render' group and cannot access /dev/kfd.
+Run: sudo usermod -aG render,video $USER
+Reboot (or log out and back in), then start ComfyUI again."
+        fi
+    fi
+
+    if [[ "$DRY_RUN" != "1" ]] && ! [[ -r /dev/kfd && -w /dev/kfd ]]; then
+        die "Still no read/write access to /dev/kfd.
+Reboot (or log out and back in) so the new group membership applies."
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Port handling
+# ---------------------------------------------------------------------------
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1
+}
+
+comfyui_ready() {
+    curl -fsS --max-time 2 "http://127.0.0.1:$1/system_stats" >/dev/null 2>&1
+}
+
+open_url() {
+    local url=$1
+    [[ "$OPEN_BROWSER" == "1" ]] || return 0
+    if [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+        warn "No graphical session detected; open $url manually."
+        return 0
+    fi
+    if command -v xdg-open >/dev/null 2>&1; then
+        xdg-open "$url" >/dev/null 2>&1 &
+    else
+        warn "xdg-open not found; open $url manually."
+    fi
+}
+
+if port_in_use "$PORT"; then
+    if comfyui_ready "$PORT"; then
+        ok "ComfyUI is already running at http://127.0.0.1:$PORT"
+        open_url "http://127.0.0.1:$PORT"
+        exit 0
+    fi
+    if [[ "$PORT_EXPLICIT" == "1" ]]; then
+        die "Port $PORT is already in use by another program."
+    fi
+    found=0
+    for candidate in $(seq $((PORT + 1)) $((PORT + 10))); do
+        if ! port_in_use "$candidate"; then
+            warn "Port $PORT is busy; using $candidate instead."
+            PORT=$candidate
+            found=1
+            break
+        fi
+    done
+    [[ "$found" == "1" ]] || die "No free port found in range $PORT-$((PORT + 10))."
+fi
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+if [[ -n "${HSA_OVERRIDE_GFX_VERSION:-}" ]]; then
+    warn "Ignoring HSA_OVERRIDE_GFX_VERSION=${HSA_OVERRIDE_GFX_VERSION} (device wheels are used)."
+    unset HSA_OVERRIDE_GFX_VERSION
+fi
+
+export PYTORCH_HIP_ALLOC_CONF=${PYTORCH_HIP_ALLOC_CONF:-expandable_segments:True}
+export MIOPEN_FIND_MODE=${MIOPEN_FIND_MODE:-FAST}
+export HF_HOME=${HF_HOME:-$MODELS_DIR/.cache/huggingface}
+export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}
+export TORCH_HOME=${TORCH_HOME:-$MODELS_DIR/.cache/torch}
+export HF_HUB_DISABLE_TELEMETRY=1
+export DO_NOT_TRACK=1
+export PYTHONUNBUFFERED=1
+
+if [[ "$DRY_RUN" != "1" ]]; then
+    mkdir -p "$HF_HOME" "$TORCH_HOME"
+fi
+
+# ---------------------------------------------------------------------------
+# Log rotation
+# ---------------------------------------------------------------------------
+LOG_FILE="$LOG_DIR/comfyui.log"
+if [[ "$DRY_RUN" != "1" && -f "$LOG_FILE" ]]; then
+    log_size=$(file_size "$LOG_FILE")
+    if (( log_size > 20 * 1024 * 1024 )); then
+        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Model summary
+# ---------------------------------------------------------------------------
+if [[ "$DRY_RUN" != "1" ]]; then
+    log "Models: $(py models-summary)"
+    if [[ ! -d "$MODELS_DIR/diffusion_models" ]] || [[ -z "$(find "$MODELS_DIR/diffusion_models" -maxdepth 1 -name '*.safetensors' -print -quit 2>/dev/null)" ]]; then
+        warn "No diffusion models found. Download them later with: ./provision.sh models --set jibmix (or --set sft)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Command
+# ---------------------------------------------------------------------------
+CMD=(
+    "$VENV_DIR/bin/python" "main.py"
+    --listen "$COMFYUI_LISTEN"
+    --port "$PORT"
+    --models-directory "$MODELS_DIR"
+    --output-directory "$OUTPUT_DIR"
+    --input-directory "$INPUT_DIR"
+    --temp-directory "$TEMP_DIR"
+    --user-directory "$USER_DIR"
+    --reserve-vram "$RESERVE_VRAM"
+    --disable-auto-launch
+    --verbose "$LOG_LEVEL" "$LOG_FILE"
+)
+
+if [[ "$LOWVRAM" == "1" ]]; then
+    CMD+=(--lowvram)
+fi
+if [[ "$CPU_ONLY" == "1" ]]; then
+    CMD+=(--cpu)
+fi
+if (( ${#EXTRA_ARGS[@]} > 0 )); then
+    CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+PORT_URL="http://127.0.0.1:$PORT"
+
+printf '\n'
+log "ComfyUI"
+printf '  URL:        %s\n' "$PORT_URL"
+printf '  Python:     %s\n' "$VENV_DIR/bin/python"
+printf '  ComfyUI:    %s (%s)\n' "$COMFYUI_DIR" "$(git -C "$COMFYUI_DIR" describe --tags --always 2>/dev/null || echo unknown)"
+printf '  Models:     %s\n' "$MODELS_DIR"
+printf '  Output:     %s\n' "$OUTPUT_DIR"
+printf '  Log file:   %s\n' "$LOG_FILE"
+if [[ "$LOWVRAM" == "1" ]]; then printf '  Mode:       lowvram\n'; fi
+if [[ "$CPU_ONLY" == "1" ]]; then printf '  Mode:       CPU only\n'; fi
+printf '\n'
+
+if [[ "$DRY_RUN" == "1" ]]; then
+    printf '[dry-run] environment:\n'
+    printf '  PYTORCH_HIP_ALLOC_CONF=%q\n' "$PYTORCH_HIP_ALLOC_CONF"
+    printf '  MIOPEN_FIND_MODE=%q\n' "$MIOPEN_FIND_MODE"
+    printf '  HF_HOME=%q\n' "$HF_HOME"
+    printf '  TORCH_HOME=%q\n' "$TORCH_HOME"
+    printf '[dry-run] cd %q && ' "$COMFYUI_DIR"
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+    exit 0
+fi
+
+# Open the browser once the server is actually answering.
+if [[ "$OPEN_BROWSER" == "1" ]]; then
+    (
+        for _ in $(seq 1 300); do
+            if curl -fsS --max-time 1 "$PORT_URL/system_stats" >/dev/null 2>&1; then
+                open_url "$PORT_URL"
+                exit 0
+            fi
+            sleep 1
+        done
+    ) >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+else
+    log "Browser auto-open disabled. Open $PORT_URL manually."
+fi
+
+cd "$COMFYUI_DIR"
+exec "${CMD[@]}"
