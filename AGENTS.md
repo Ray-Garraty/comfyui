@@ -202,6 +202,12 @@ Important values:
   Keep that single entry point; do not duplicate the check list in the hook.
   `git commit --no-verify` bypasses it when genuinely necessary.
 
+**Commit only when the user explicitly asks for a commit.** Never create
+commits on your own initiative, and never split work into a stream of small
+commits to "save progress". A request to change files is not a request to
+commit them: leave the changes staged/unstaged and wait for the user. When a
+commit is requested, make one coherent commit unless the user asks otherwise.
+
 ## Safe workflow for agents
 
 1. Read this file and `provision/config/provision.env`; avoid reading generated
