@@ -1,0 +1,5 @@
+{
+  // ComfyUI/ is a nested upstream clone used by the provisioner.
+  // Keep it out of the Source Control view: its history is not ours.
+  "git.ignoredRepositories": ["ComfyUI"]
+}

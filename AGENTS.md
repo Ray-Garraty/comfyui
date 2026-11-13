@@ -57,6 +57,31 @@ comfyprov/auth.py      Civitai token storage (mode 600)
 comfyprov/report.py    Finding/level rendering shared by checks and verify
 ```
 
+## Design rule: Python decides, bash executes
+
+**Every business decision ("what should be done") lives in a reusable Python
+module under `provision/lib/comfyprov/`. Bash scripts (`provision.sh`,
+`start-comfyui.sh`, `provision/lib/common.sh`) only perform execution,
+privileges, and IO.**
+
+This means:
+
+- No `if`/`case` logic about *whether* a step is needed lives in bash. All
+  conditionality is computed by `plan.py` from `facts.py`.
+- No duplicated settings or version checks across `provision.sh` and Python.
+  `provision/config/provision.env` is the single source; `comfyprov/config.py`
+  parses it with the same precedence (`env wins over default`).
+- No duplicated file/size/SHA256 verification. `comfyprov/models.py` owns the
+  manifest check, and both the planner and `download_file` call it.
+- Every planner branch must have unit tests in `provision/tests/` that use
+  `FakeProbe` / `FakeClient` and never touch the real host, network, or sudo.
+- Shell may only invoke Python actions (`apply_action`), format output, and
+  handle privileges/exit codes.
+
+If a new capability is needed, add a planner branch in `plan.py`, extend the
+action vocabulary in `actions.py` only when unavoidable, and add tests before
+shipping.
+
 ## Layout
 
 ```
@@ -227,12 +252,15 @@ commit is requested, make one coherent commit unless the user asks otherwise.
 
 ## Current state (update when it changes)
 
-- Partially provisioned: `ComfyUI/` (v0.45.3) and `venv/` exist; `system` and
-  `gpu` planning reports everything satisfied except session groups.
-- The user is in `render`/`video` in `/etc/group` but not in the current login
-  session; reboot or re-login is still pending.
+- Fully provisioned: `ComfyUI/` (v0.45.3), `venv/` with torch `2.13.0+rocm10.1.0`,
+  ComfyUI-Manager `4.3`, launcher and desktop shortcuts installed.
+- `system`, `gpu`, `comfyui`, `manager`, `launcher` all report `ok` with no pending
+  actions; `verify` passed (GPU matmul OK, `/system_stats` and `/manager/version`
+  reachable). No reboot required; `/dev/kfd` accessible in current session.
 - No model files and no `~/.config/comfyui/civitai.token` yet; `models` is
   waiting for `auth`/`--set sft`.
 - `BIG` is mounted with ~889 GB free and is not in `/etc/fstab`.
-- Git repository initialized on `main` with the first commit; local identity is
-  `vlabe <vlabe@localhost>` and the pre-commit hook is active.
+- Git repository initialized on `main`; local identity `vlabe <vlabe@localhost>`,
+  pre-commit hook active. Last commit: `b6a5435 Require explicit user request
+  before committing` — plus the current uncommitted AGENTS.md changes shown
+  below.

@@ -201,13 +201,13 @@ cmd_verify() {
     local url=""
 
     cleanup() {
-        if [[ "$srv_started" == "1" && -n "$srv_pid" ]] && kill -0 "$srv_pid" 2>/dev/null; then
-            kill -INT "$srv_pid" 2>/dev/null || true
+        if [[ "${srv_started:-0}" == "1" && -n "${srv_pid:-}" ]] && kill -0 "${srv_pid}" 2>/dev/null; then
+            kill -INT "${srv_pid}" 2>/dev/null || true
             for _ in $(seq 1 40); do
-                kill -0 "$srv_pid" 2>/dev/null || break
+                kill -0 "${srv_pid}" 2>/dev/null || break
                 sleep 0.5
             done
-            kill -KILL "$srv_pid" 2>/dev/null || true
+            kill -KILL "${srv_pid}" 2>/dev/null || true
         fi
     }
     trap cleanup EXIT
@@ -354,6 +354,15 @@ cmd_test() {
     else
         failed=1
     fi
+
+    if bash -n "$HERE/provision/tests/verify_trap_test.sh" && \
+       bash "$HERE/provision/tests/verify_trap_test.sh" >/dev/null 2>&1; then
+        ok "trap cleanup regression test"
+    else
+        warn "trap cleanup regression test failed"
+        failed=1
+    fi
+
     return "$failed"
 }
 
