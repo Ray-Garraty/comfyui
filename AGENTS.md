@@ -13,9 +13,6 @@ one specific Linux machine.
 - Target host: Linux Mint 22.3 (Ubuntu 24.04 base), x86_64, Python 3.12.
 - GPU: AMD Radeon RX 6700 XT, Navi 22, **gfx1031**, 12 GB VRAM, no matrix cores.
 - No NVIDIA/CUDA. Uses AMD multi-arch PyTorch ROCm wheels; no system-wide ROCm.
-- Models live on a separate ext4 disk labeled `BIG`, mounted at
-  `/media/vlabe/BIG`. `BIG` is **not** in `/etc/fstab`; scripts mount it with
-  `udisksctl` by UUID.
 - The app itself lives in `/home/vlabe/Documents/comfyui`.
 - Localhost only (`127.0.0.1`), no systemd unit, no autostart, no swap by default.
 
@@ -47,7 +44,6 @@ comfyprov/probe.py     root-aware read-only host access (injectable for tests)
 comfyprov/gpu.py       gfx parsing from KFD, group/permission logic
 comfyprov/facts.py     single snapshot of the machine
 comfyprov/plan.py      all step planners + status/reboot classification
-comfyprov/models.py    manifest parsing, sets, size/sha verification
 comfyprov/checks.py    preflight + doctor
 comfyprov/server.py    HTTP helpers (stats, manager, history)
 comfyprov/smoke.py     MOSS workflow + PNG validation
@@ -71,8 +67,6 @@ This means:
 - No duplicated settings or version checks across `provision.sh` and Python.
   `provision/config/provision.env` is the single source; `comfyprov/config.py`
   parses it with the same precedence (`env wins over default`).
-- No duplicated file/size/SHA256 verification. `comfyprov/models.py` owns the
-  manifest check, and both the planner and `download_file` call it.
 - Every planner branch must have unit tests in `provision/tests/` that use
   `FakeProbe` / `FakeClient` and never touch the real host, network, or sudo.
 - Shell may only invoke Python actions (`apply_action`), format output, and
@@ -92,7 +86,7 @@ provision/
 ├── lib/common.sh                # executor, logging, sudo, downloads
 ├── lib/comfyprov/               # business logic (see above)
 ├── config/provision.env         # single source of defaults
-├── config/models.tsv            # model manifest: key/source/target/file/size/sha/url
+├── config/models.md             # generative AI model settings (separate from AGENTS.md)
 ├── tests/                       # unittest/pytest suite with fake host and HTTP client
 └── .state/                      # runtime: lock, constraints, pip/torch stamps
 ```
@@ -115,7 +109,6 @@ Generated at provisioning time (do not edit by hand):
 ./provision.sh system|gpu|comfyui|manager|launcher|swap
 ./provision.sh verify [--full]
 ./provision.sh auth
-./provision.sh models --set jibmix|sft|both [--check] [--verify]
 ./provision.sh doctor
 ./provision.sh update [--force]
 ./provision.sh test                # bash -n, shellcheck, python tests
@@ -123,9 +116,8 @@ Generated at provisioning time (do not edit by hand):
 
 Global flags: `--dry-run`, `--yes`, `--force`, `--full`, `--no-color`.
 
-`all` intentionally **does not download models** and never runs sudo as root:
-steps prompt for sudo only when they need it. Models are opt-in via
-`models --set ...`.
+`all` never runs sudo as root:
+steps prompt for sudo only when they need it.
 
 Exit codes (documented in `comfyprov/actions.py`): `0` ok, `1` error, `2` usage,
 `3` reboot/re-login required, `4` missing prerequisite, `5` verification failed.
@@ -160,8 +152,6 @@ reachable from the current session.
   `provision/.state/`; torch versions are compared via `pip show` output.
 - Fail with `die`; use `ok`/`warn` for status. Never run the whole script as
   root; call `require_sudo` for root work.
-- Do not put secrets in argv. Civitai downloads use a temporary curl config
-  containing `url = "...&token=..."`; keep that pattern.
 - Bash pitfall: `[[ cond ]] && cmd` as the **last** command of a function
   returns 1 and aborts under `set -e`. Use an explicit `if`.
 
@@ -180,25 +170,6 @@ Important values:
 - Device extras are `torch[device-gfx1031]` etc.; `gfx1031` is auto-detected
   from `/sys/class/kfd/kfd/topology`. Do **not** set
   `HSA_OVERRIDE_GFX_VERSION`; the launcher unsets it intentionally.
-- Model manifest columns (tab-separated):
-  `key source target filename size_bytes sha256 url`.
-
-## Models: important context
-
-- The Civitai model "Jib Mix Moss Realistic" is **MOSS Image**, not SDXL.
-  It needs three files: diffusion model, Qwen3.5 text encoder, FLUX.2 VAE.
-- `jibmix` set = `Jib_Mix_Moss_V2_H_int8_00001_.safetensors` +
-  `qwen3.5_9b_w4a8_gptq.safetensors` + `flux2-vae_small.safetensors`.
-- `sft` set = official `moss_image_sft_int8_convrot.safetensors` + the same TE/VAE.
-- Civitai requires an API token (stored at `$CIVITAI_TOKEN_FILE`, mode 600).
-  Hugging Face files are public.
-- Downloads support `.part` resume, retries, size + SHA256 verification, and
-  atomic rename. Verification is delegated to `comfyprov verify-file`, so the
-  manifest check has exactly one implementation. Keep these properties.
-- Recommended Jib Mix settings: 4–9 steps, CFG 1, sampler `er_sde`, scheduler
-  `simple`. Official SFT defaults are closer to 25 steps / CFG 2.5.
-- RDNA2 has no matrix cores; `comfy-kitchen` int8/WMMA paths may fall back to
-  slower kernels. This is expected, not a provisioning bug.
 
 ## Verification behavior
 
@@ -210,8 +181,6 @@ Important values:
   temporary server on ports `18188–18200` and shuts it down via a trap.
 - `comfyprov verify --url ...` checks `/system_stats` and `/manager/version`
   (Manager returns plain text).
-- With `--full`, `verify.resolve_diffusion` picks Jib Mix first, then SFT, runs
-  `smoke.run_generation`, and validates the PNG.
 
 `doctor` and `preflight` are read-only and safe at any time.
 
@@ -244,12 +213,9 @@ commit is requested, make one coherent commit unless the user asks otherwise.
 4. Prefer `./provision.sh --dry-run all` as the integration check (no sudo, no
    writes). `./provision.sh status`, `preflight`, `doctor`, `verify-file`,
    `facts` are safe real runs.
-5. Do **not** run `./provision.sh all`, `system`, `gpu`, `swap`, `update`, or
-   model downloads unless the user explicitly asks: they use sudo, modify
-   groups/udev/sysctl, or transfer many gigabytes.
-6. `./provision.sh models --check` exits 5 when files are missing; that is
-   expected before the user downloads models.
-
+5. Do **not** run `./provision.sh all`, `system`, `gpu`, `swap`, `update` unless
+   the user explicitly asks: they use sudo, modify groups/udev/sysctl, or transfer
+   many gigabytes.
 ## Current state (update when it changes)
 
 - Fully provisioned: `ComfyUI/` (v0.45.3), `venv/` with torch `2.13.0+rocm10.1.0`,
@@ -257,8 +223,6 @@ commit is requested, make one coherent commit unless the user asks otherwise.
 - `system`, `gpu`, `comfyui`, `manager`, `launcher` all report `ok` with no pending
   actions; `verify` passed (GPU matmul OK, `/system_stats` and `/manager/version`
   reachable). No reboot required; `/dev/kfd` accessible in current session.
-- No model files and no `~/.config/comfyui/civitai.token` yet; `models` is
-  waiting for `auth`/`--set sft`.
 - `BIG` is mounted with ~889 GB free and is not in `/etc/fstab`.
 - Git repository initialized on `main`; local identity `vlabe <vlabe@localhost>`,
   pre-commit hook active. Last commit: `b6a5435 Require explicit user request
