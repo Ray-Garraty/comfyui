@@ -25,17 +25,21 @@ DIFF_DIR="$MODELS_DIR/diffusion_models"
 
 LOG_FILE="$LOG_DIR/generate.log"
 mkdir -p "$LOG_DIR"
-if [[ -f "$LOG_FILE" ]]; then
-    log_size=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
-    if (( log_size > 20 * 1024 * 1024 )); then
-        mv -f "$LOG_FILE" "$LOG_FILE.1" 2>/dev/null || true
-    fi
-fi
+: > "$LOG_FILE"
 
-# Лог-файл открыт напрямую на fd 3 — без pipe/tee, чтобы при жёстком
-# обрыве/перезагрузке не терять буферизованный вывод.
+# Log file opened directly on fd 3 — without pipe/tee, so output isn't
+# lost on hard crash or reboot.
 exec 3>>"$LOG_FILE"
 
+# Prevent concurrent generate.sh instances.
+LOCK_FILE="$LOG_DIR/generate.lock"
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    die "Another generate.sh instance is already running."
+fi
+
+# Each function writes to terminal (stdout/stderr) and directly to file (fd 3),
+# with its own timestamp. No duplicates.
 die()  { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'ERROR: %s %s\n' "$ts" "$*"; printf 'ERROR: %s %s\n' "$ts" "$*" >&3; exit 1; }
 ok()   { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'OK: %s %s\n' "$ts" "$*"; printf 'OK: %s %s\n' "$ts" "$*" >&3; }
 warn() { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'WARN: %s %s\n' "$ts" "$*" >&2; printf 'WARN: %s %s\n' "$ts" "$*" >&3; }
@@ -101,13 +105,15 @@ PY_ARGS=(
     "${MODELS[@]}"
 )
 
+# Python output: stdout+stderr go to log file (fd 3) with timestamp and
+# to terminal. stdin stays connected to terminal, so interactive Python
+# prompts (Select [1-1]:, Prompt: etc.) work.
 set +e
-python3 -m comfyprov.generate "${PY_ARGS[@]}" 2>&1 | while IFS= read -r line; do
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    printf '%s %s\n' "$ts" "$line"
-    printf '%s %s\n' "$ts" "$line" >&3
-done
-PY_EXIT=${PIPESTATUS[0]}
+python3 -m comfyprov.generate "${PY_ARGS[@]}" > >(while IFS= read -r line; do
+    printf '%s\n' "$line"
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$line" >&3
+done) 2>&1
+PY_EXIT=$?
 set -e
 
 # ---------------------------------------------------------------------------

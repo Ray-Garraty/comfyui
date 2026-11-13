@@ -583,6 +583,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     print()
+    if not saved:
+        print(f"ERROR: No images were generated to {output_dir}", file=sys.stderr)
+        return 1
     print(f"\nGenerated {len(saved)} image(s) to {output_dir}:")
     for img in saved:
         print(f"  {img.path}")

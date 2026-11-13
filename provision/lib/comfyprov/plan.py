@@ -166,6 +166,7 @@ class Planner:
     def system(self) -> Plan:
         plan = Plan("system")
         self.mount(plan)
+        _big_fstab_actions(self, plan)
 
         chosen, skipped = _resolve_packages(self.facts, layout.APT_REQUIRED + layout.APT_OPTIONAL)
         missing = [name for name in chosen if name not in self.facts.packages]
@@ -726,6 +727,25 @@ def _download_params(config: Config, entry: models.ModelEntry) -> dict:
         "source": entry.source,
         "token_file": str(config.civitai_token_file) if entry.requires_token else "",
     }
+
+
+def _big_fstab_actions(planner: Planner, plan: Plan) -> None:
+    config = planner.config
+    facts = planner.facts
+    mount = str(config.big_mount)
+    fstab_line = f"UUID={config.big_uuid} {mount} ext4 defaults,nofail 0 2"
+    fstab_ok = any(line.split("#", 1)[0].strip() == fstab_line for line in facts.fstab.splitlines())
+    plan.add(
+        Action(
+            id="big-fstab",
+            kind="append_line",
+            summary=f"Persist {mount} in /etc/fstab",
+            params={"path": "/etc/fstab", "line": fstab_line},
+            satisfied=fstab_ok,
+            sudo=True,
+            effect=EFFECT_BOOT,
+        )
+    )
 
 
 def _swap_actions(planner: Planner, plan: Plan) -> None:

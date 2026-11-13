@@ -355,6 +355,15 @@ cmd_test() {
         failed=1
     fi
 
+    # Business requirement: an e2e test failure is a hard fail for any reason
+    # (missing server, missing model, assertion, skip) — it blocks the commit.
+    # No fallback, no warning-only path.
+    if PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m pytest -q -m e2e "$HERE/provision/tests"; then
+        ok "e2e tests"
+    else
+        failed=1
+    fi
+
     if bash -n "$HERE/provision/tests/verify_trap_test.sh" && \
        bash "$HERE/provision/tests/verify_trap_test.sh" >/dev/null 2>&1; then
         ok "trap cleanup regression test"

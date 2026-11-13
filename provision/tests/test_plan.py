@@ -20,7 +20,13 @@ from helpers import (
 
 from comfyprov import layout, models
 from comfyprov.facts import collect
-from comfyprov.plan import Options, Planner, reboot_needed, status
+from comfyprov.plan import (
+    EFFECT_BOOT,
+    Options,
+    Planner,
+    reboot_needed,
+    status,
+)
 from comfyprov.probe import RunResult
 
 
@@ -44,6 +50,12 @@ def host_after_system(config, plan_obj):
                 modes[action.params["path"]] = action.params["mode"]
         elif action.kind == "write_file":
             files[action.params["path"]] = action.params["content"]
+        elif action.kind == "append_line":
+            files[action.params["path"]] = (
+                files.get(action.params["path"], "")
+                + action.params["line"]
+                + ("\n" if not action.params["line"].endswith("\n") else "")
+            )
         elif action.kind == "apt_install":
             packages.update(action.params["packages"])
         elif action.id == "sysctl-apply":
@@ -386,6 +398,33 @@ class SwapPlanTests(PlanTestCase):
         self.assertEqual(layout.parse_size("1024"), 1024)
         with self.assertRaises(ValueError):
             layout.parse_size("0G")
+
+
+class BigFstabPlanTests(PlanTestCase):
+    def test_missing_big_fstab_is_planned(self) -> None:
+        plan_obj = plan(self.config, clean_host(self.config), "system")
+        ids = {action.id for action in plan_obj.actions}
+        self.assertIn("big-fstab", ids)
+        action = next(a for a in plan_obj.actions if a.id == "big-fstab")
+        self.assertFalse(action.satisfied)
+        self.assertEqual(action.params["path"], "/etc/fstab")
+        self.assertTrue(
+            action.params["line"].startswith(
+                f"UUID={self.config.big_uuid} {self.config.big_mount} ext4 defaults,nofail 0 2"
+            )
+        )
+        self.assertTrue(action.sudo)
+        self.assertEqual(action.effect, EFFECT_BOOT)
+
+    def test_present_big_fstab_is_satisfied(self) -> None:
+        line = f"UUID={self.config.big_uuid} {self.config.big_mount} ext4 defaults,nofail 0 2\n"
+        probe = clean_host(
+            self.config,
+            files={**base_files(self.config), "/etc/fstab": line},
+        )
+        plan_obj = plan(self.config, probe, "system")
+        action = next(a for a in plan_obj.actions if a.id == "big-fstab")
+        self.assertTrue(action.satisfied)
 
 
 class StatusTests(PlanTestCase):

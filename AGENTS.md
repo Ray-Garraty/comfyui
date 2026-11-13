@@ -18,6 +18,13 @@ one specific Linux machine.
 
 Do not hardcode assumptions that conflict with these unless the user asks.
 
+## Project language
+
+The project language is **English**. All code, comments, commit messages,
+issue text, documentation, and agent reasoning must be in English. Russian
+(or any other language) is not permitted in code comments, commit messages,
+or user-facing strings produced by the project.
+
 ## Architecture: plan in Python, apply in bash
 
 All decisions live in the pure-stdlib package `provision/lib/comfyprov/`
@@ -194,13 +201,19 @@ Important values:
 - `.githooks/pre-commit` calls `./provision.sh test`, which runs `bash -n`,
   `shellcheck`, `ruff format --check`, `ruff check`, `pyright` and `pytest`.
   Keep that single entry point; do not duplicate the check list in the hook.
-  `git commit --no-verify` bypasses it when genuinely necessary.
 
 **Commit only when the user explicitly asks for a commit.** Never create
 commits on your own initiative, and never split work into a stream of small
 commits to "save progress". A request to change files is not a request to
 commit them: leave the changes staged/unstaged and wait for the user. When a
 commit is requested, make one coherent commit unless the user asks otherwise.
+
+### Git history safety
+
+- **Forbidden:** resetting commits in a way that deletes change history
+  (e.g. `git reset --hard` discarding commits, force-push that removes history).
+- **Allowed:** resetting commits **without losing change history**
+  (e.g. `git reset --soft` / `--mixed` that keep commits reachable).
 
 ## Safe workflow for agents
 
@@ -216,15 +229,16 @@ commit is requested, make one coherent commit unless the user asks otherwise.
 5. Do **not** run `./provision.sh all`, `system`, `gpu`, `swap`, `update` unless
    the user explicitly asks: they use sudo, modify groups/udev/sysctl, or transfer
    many gigabytes.
-## Current state (update when it changes)
+## Privilege boundaries
 
-- Fully provisioned: `ComfyUI/` (v0.45.3), `venv/` with torch `2.13.0+rocm10.1.0`,
-  ComfyUI-Manager `4.3`, launcher and desktop shortcuts installed.
-- `system`, `gpu`, `comfyui`, `manager`, `launcher` all report `ok` with no pending
-  actions; `verify` passed (GPU matmul OK, `/system_stats` and `/manager/version`
-  reachable). No reboot required; `/dev/kfd` accessible in current session.
-- `BIG` is mounted with ~889 GB free and is not in `/etc/fstab`.
-- Git repository initialized on `main`; local identity `vlabe <vlabe@localhost>`,
-  pre-commit hook active. Last commit: `b6a5435 Require explicit user request
-  before committing` — plus the current uncommitted AGENTS.md changes shown
-  below.
+`./provision.sh` is for environment setup and dependency installation only.
+`generate.sh` is for image generation only — never add provisioning logic there.
+
+- **Never ask the user for a sudo password.** If a step needs root privileges,
+  add it to the provision script (`provision.sh`, `provision/lib/common.sh`,
+  `comfyprov/plan.py`) and tell the user to run `./provision.sh <step>`
+  themselves; the script will prompt for sudo when needed.
+- **Non-root operations** may be run by the agent directly, **except** downloads
+  of single files larger than **500 MB** — those require explicit user request.
+- Never run the whole provision script as root; use `require_sudo` for root
+  work inside scripts.
