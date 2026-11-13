@@ -46,6 +46,8 @@ class GenerationSettings:
     neg_prompt: str
     clip_model: str
     vae_model: str
+    use_tiled_vae: bool
+    tile_size: int
 
 
 @dataclass(frozen=True)
@@ -218,8 +220,19 @@ def build_workflow(settings: GenerationSettings) -> dict[str, Any]:
             "class_type": "KSampler",
         },
         "8": {
-            "inputs": {"samples": ["7", 0], "vae": ["3", 0]},
-            "class_type": "VAEDecode",
+            "inputs": (
+                {
+                    "samples": ["7", 0],
+                    "vae": ["3", 0],
+                    "tile_size": settings.tile_size,
+                    "overlap": 64,
+                    "temporal_size": 64,
+                    "temporal_overlap": 8,
+                }
+                if settings.use_tiled_vae
+                else {"samples": ["7", 0], "vae": ["3", 0]}
+            ),
+            "class_type": "VAEDecodeTiled" if settings.use_tiled_vae else "VAEDecode",
         },
         "9": {
             "inputs": {
@@ -307,24 +320,39 @@ def run_generation(
     output_dir: str | os.PathLike[str],
     progress_callback: Callable[[int], None] | None = None,
 ) -> list[GeneratedImage]:
-    """Queue a workflow, wait for completion, download images."""
-    workflow = build_workflow(settings)
-    prompt_id = client.queue_prompt(workflow)
-    outputs = client.wait_for_completion(prompt_id, progress_callback=progress_callback)
+    """Queue a workflow, wait for completion, download images.
 
+    Images are generated one-by-one to minimise peak VRAM usage on RDNA2.
+    """
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     saved: list[GeneratedImage] = []
-    for _node_id, node_out in outputs.items():
-        for img in node_out.get("images", []):
-            filename = img["filename"]
-            subfolder = img.get("subfolder", "")
-            ftype = img.get("type", "output")
-            data = client.download_image(filename, subfolder, ftype)
-            out_path = out_dir / filename
-            out_path.write_bytes(data)
-            saved.append(GeneratedImage(path=str(out_path), filename=filename))
+
+    for i in range(settings.count):
+        image_seed = settings.seed
+        if image_seed >= 0:
+            image_seed = settings.seed + i
+
+        single = dataclass_replace(
+            settings,
+            count=1,
+            seed=image_seed,
+        )
+        workflow = build_workflow(single)
+        prompt_id = client.queue_prompt(workflow)
+        outputs = client.wait_for_completion(prompt_id, progress_callback=progress_callback)
+
+        for _node_id, node_out in outputs.items():
+            for img in node_out.get("images", []):
+                filename = img["filename"]
+                subfolder = img.get("subfolder", "")
+                ftype = img.get("type", "output")
+                data = client.download_image(filename, subfolder, ftype)
+                out_path = out_dir / filename
+                out_path.write_bytes(data)
+                saved.append(GeneratedImage(path=str(out_path), filename=filename))
+
     return saved
 
 
@@ -463,6 +491,7 @@ def interactive(
     except ValueError:
         print(f"Invalid size '{size_raw}', using {width}x{height}")
     count = _ask_int("Number of images", count)
+    # Images are generated one-by-one to minimise peak VRAM usage on RDNA2.
     steps = _ask_int("Steps", steps)
     cfg = _ask_float("CFG", cfg)
     sampler_default = sampler if sampler in SAMPLERS else SAMPLERS[0]
@@ -470,6 +499,13 @@ def interactive(
 
     scheduler_default = scheduler if scheduler in SCHEDULERS else SCHEDULERS[0]
     scheduler = _select_from_list("Schedulers", SCHEDULERS, SCHEDULERS.index(scheduler_default) + 1)
+
+    # Tiled VAE decode reduces peak VRAM usage during the final decode stage.
+    # Tiled VAE decode is on by default on RDNA2 (12 GB VRAM, no matrix cores)
+    # to avoid OOM during the final latent-to-image decode.
+    use_tiled_vae = settings_source.use_tiled_vae if settings_source else True
+    tile_size = settings_source.tile_size if settings_source else 512
+
     seed_raw = _ask("Seed (-1 for random)", str(seed))
     try:
         seed = int(seed_raw)
@@ -498,6 +534,8 @@ def interactive(
         neg_prompt=neg_prompt,
         clip_model=clip_model,
         vae_model=vae_model,
+        use_tiled_vae=use_tiled_vae,
+        tile_size=tile_size,
     )
 
 

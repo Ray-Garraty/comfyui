@@ -145,6 +145,8 @@ class TestBuildWorkflow(unittest.TestCase):
             seed=-1,
             prompt="a cat",
             neg_prompt="",
+            use_tiled_vae=False,
+            tile_size=512,
         )
         wf = build_workflow(settings)
 
@@ -273,6 +275,8 @@ class TestRunGeneration(unittest.TestCase):
             seed=1,
             prompt="hi",
             neg_prompt="",
+            use_tiled_vae=False,
+            tile_size=512,
         )
 
         fake = mock.Mock(spec=ComfyUIClient)
@@ -340,6 +344,8 @@ class TestInteractive(unittest.TestCase):
         self.assertEqual(settings.seed, 42)
         self.assertEqual(settings.prompt, "a cat")
         self.assertEqual(settings.neg_prompt, "")
+        self.assertEqual(settings.use_tiled_vae, True)
+        self.assertEqual(settings.tile_size, 512)
 
     def test_interactive_empty_prompt_raises(self):
         inputs = iter(

@@ -23,11 +23,6 @@ source "$INSTALL_DIR/provision/config/provision.env"
 API="http://127.0.0.1:${COMFYUI_PORT}"
 DIFF_DIR="$MODELS_DIR/diffusion_models"
 
-die()  { echo "ERROR: $*" | tee -a "$LOG_FILE" >&2; exit 1; }
-ok()   { echo "OK: $*" | tee -a "$LOG_FILE"; }
-warn() { echo "WARN: $*" | tee -a "$LOG_FILE" >&2; }
-log()  { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" | tee -a "$LOG_FILE"; }
-
 LOG_FILE="$LOG_DIR/generate.log"
 mkdir -p "$LOG_DIR"
 if [[ -f "$LOG_FILE" ]]; then
@@ -37,7 +32,14 @@ if [[ -f "$LOG_FILE" ]]; then
     fi
 fi
 
-exec > >(tee -a "$LOG_FILE") 2>&1
+# Лог-файл открыт напрямую на fd 3 — без pipe/tee, чтобы при жёстком
+# обрыве/перезагрузке не терять буферизованный вывод.
+exec 3>>"$LOG_FILE"
+
+die()  { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'ERROR: %s %s\n' "$ts" "$*"; printf 'ERROR: %s %s\n' "$ts" "$*" >&3; exit 1; }
+ok()   { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'OK: %s %s\n' "$ts" "$*"; printf 'OK: %s %s\n' "$ts" "$*" >&3; }
+warn() { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf 'WARN: %s %s\n' "$ts" "$*" >&2; printf 'WARN: %s %s\n' "$ts" "$*" >&3; }
+log()  { local ts; ts="$(date '+%Y-%m-%d %H:%M:%S')"; printf '%s %s\n' "$ts" "$*"; printf '%s %s\n' "$ts" "$*" >&3; }
 
 log "=== generate.sh started ==="
 log "Install dir: $INSTALL_DIR"
@@ -64,6 +66,8 @@ comfyui_ready() {
 if ! comfyui_ready; then
     warn "ComfyUI is not running at $API. Starting it (--no-browser)..."
     "$INSTALL_DIR/start-comfyui.sh" --no-browser >/tmp/comfyui-generate.log 2>&1 &
+    COMFYUI_PID=$!
+    COMFYUI_WAS_STARTED=1
     for _ in $(seq 1 180); do
         if comfyui_ready; then
             ok "ComfyUI is ready at $API"
@@ -74,6 +78,7 @@ if ! comfyui_ready; then
     comfyui_ready || die "ComfyUI did not become ready. Check /tmp/comfyui-generate.log"
 else
     ok "ComfyUI already running at $API"
+    COMFYUI_WAS_STARTED=0
 fi
 
 log "ComfyUI is ready at $API"
@@ -87,4 +92,32 @@ mapfile -t MODELS < <(find "$DIFF_DIR" -maxdepth 1 -type f -name '*.safetensors'
 export PYTHONPATH="$INSTALL_DIR/provision/lib:$INSTALL_DIR/comfy_kitchen_config${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
-exec python3 -m comfyprov.generate "$API" "$OUTPUT_DIR" "$DIFF_DIR" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "${MODELS[@]}"
+PY_ARGS=(
+    "$API"
+    "$OUTPUT_DIR"
+    "$DIFF_DIR"
+    "$MODELS_DIR/text_encoders"
+    "$MODELS_DIR/vae"
+    "${MODELS[@]}"
+)
+
+set +e
+python3 -m comfyprov.generate "${PY_ARGS[@]}" 2>&1 | while IFS= read -r line; do
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    printf '%s %s\n' "$ts" "$line"
+    printf '%s %s\n' "$ts" "$line" >&3
+done
+PY_EXIT=${PIPESTATUS[0]}
+set -e
+
+# ---------------------------------------------------------------------------
+# Graceful exit of ComfyUI if we started it
+# ---------------------------------------------------------------------------
+if [[ "$COMFYUI_WAS_STARTED" == "1" && -n "${COMFYUI_PID:-}" ]]; then
+    log "Stopping ComfyUI (PID $COMFYUI_PID) after generation completes..."
+    kill "$COMFYUI_PID" 2>/dev/null || true
+    wait "$COMFYUI_PID" 2>/dev/null || true
+    log "ComfyUI stopped."
+fi
+
+exit "$PY_EXIT"
