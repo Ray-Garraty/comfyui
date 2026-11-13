@@ -20,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
@@ -263,19 +264,34 @@ class ComfyUIClient:
             raise RuntimeError("ComfyUI did not return a prompt_id")
         return prompt_id
 
-    def wait_for_completion(self, prompt_id: str, timeout_s: int = 600) -> dict:
+    def wait_for_completion(
+        self,
+        prompt_id: str,
+        timeout_s: int = 600,
+        progress_callback: Callable[[int], None] | None = None,
+    ) -> dict:
         history_url = f"{self.base_url}/history/{prompt_id}"
         deadline = time.time() + timeout_s
+        start = time.time()
+        last_tick = 0.0
         while time.time() < deadline:
             try:
                 with urllib.request.urlopen(history_url, timeout=10) as resp:
                     history = json.loads(resp.read().decode("utf-8"))
             except urllib.error.URLError:
-                time.sleep(2)
+                elapsed = int(time.time() - start)
+                if progress_callback and elapsed - last_tick >= 1:
+                    progress_callback(elapsed)
+                    last_tick = float(elapsed)
+                time.sleep(1)
                 continue
             if prompt_id in history:
                 return history[prompt_id].get("outputs", {})
-            time.sleep(2)
+            elapsed = int(time.time() - start)
+            if progress_callback and elapsed - last_tick >= 1:
+                progress_callback(elapsed)
+                last_tick = float(elapsed)
+            time.sleep(1)
         raise TimeoutError(f"timeout waiting for prompt {prompt_id} to finish")
 
     def download_image(self, filename: str, subfolder: str, ftype: str) -> bytes:
@@ -289,11 +305,12 @@ def run_generation(
     client: ComfyUIClient,
     settings: GenerationSettings,
     output_dir: str | os.PathLike[str],
+    progress_callback: Callable[[int], None] | None = None,
 ) -> list[GeneratedImage]:
     """Queue a workflow, wait for completion, download images."""
     workflow = build_workflow(settings)
     prompt_id = client.queue_prompt(workflow)
-    outputs = client.wait_for_completion(prompt_id)
+    outputs = client.wait_for_completion(prompt_id, progress_callback=progress_callback)
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -516,11 +533,18 @@ def main(argv: list[str] | None = None) -> int:
 
     client = ComfyUIClient(api_url)
     try:
-        saved = run_generation(client, settings, output_dir)
+        saved = run_generation(
+            client,
+            settings,
+            output_dir,
+            progress_callback=lambda secs: print(f"\rGenerating… {secs}s elapsed", end="", flush=True),
+        )
     except (RuntimeError, TimeoutError, ValueError) as exc:
+        print()
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
+    print()
     print(f"\nGenerated {len(saved)} image(s) to {output_dir}:")
     for img in saved:
         print(f"  {img.path}")
