@@ -201,6 +201,12 @@ export TORCH_HOME=${TORCH_HOME:-$MODELS_DIR/.cache/torch}
 export HF_HUB_DISABLE_TELEMETRY=1
 export DO_NOT_TRACK=1
 export PYTHONUNBUFFERED=1
+# comfy_kitchen_config/sitecustomize.py patches torch._int_mm for RDNA2 (no
+# matrix cores: hipblasLt answers HIPBLAS_STATUS_INVALID_VALUE) and filters
+# comfy-kitchen's int8 linear handler. Python imports sitecustomize only when
+# its directory is on sys.path, so the launcher exports it: without this the
+# server looks healthy and every int8 model fails at the first matmul.
+export PYTHONPATH="$SCRIPT_DIR/comfy_kitchen_config:$SCRIPT_DIR/provision/lib${PYTHONPATH:+:$PYTHONPATH}"
 # A Python-level segfault/abort then prints the C traceback to stderr (and thus
 # into the log files) instead of dying silently.
 export PYTHONFAULTHANDLER=1
@@ -291,6 +297,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
     printf '  MIOPEN_FIND_MODE=%q\n' "$MIOPEN_FIND_MODE"
     printf '  HF_HOME=%q\n' "$HF_HOME"
     printf '  TORCH_HOME=%q\n' "$TORCH_HOME"
+    printf '  PYTHONPATH=%q\n' "$PYTHONPATH"
     printf '[dry-run] cd %q && ' "$COMFYUI_DIR"
     printf '%q ' "${CMD[@]}"
     printf '\n'

@@ -89,6 +89,12 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required."
 mountpoint -q "$BIG_MOUNT" 2>/dev/null || die "BIG disk not mounted at $BIG_MOUNT."
 [[ -d "$DIFF_DIR" ]] || die "Diffusion models directory not found: $DIFF_DIR"
 
+# The server started below inherits this environment, and the generator needs
+# it too: comfy_kitchen_config carries sitecustomize.py, which patches
+# torch._int_mm for RDNA2. Exporting it after starting the server left the child
+# without the patch, so int8 models failed on hipblasLt.
+export PYTHONPATH="$INSTALL_DIR/provision/lib:$INSTALL_DIR/comfy_kitchen_config${PYTHONPATH:+:$PYTHONPATH}"
+
 # ---------------------------------------------------------------------------
 # Ensure ComfyUI is running
 # ---------------------------------------------------------------------------
@@ -124,7 +130,6 @@ log "ComfyUI is ready at $API"
 mapfile -t MODELS < <(find "$DIFF_DIR" -maxdepth 1 -type f -name '*.safetensors' -printf '%f\n' 2>/dev/null | sort)
 [[ ${#MODELS[@]} -gt 0 ]] || die "No .safetensors models found in $DIFF_DIR"
 
-export PYTHONPATH="$INSTALL_DIR/provision/lib:$INSTALL_DIR/comfy_kitchen_config${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$OUTPUT_DIR" "$LOG_DIR"
 
 PY_ARGS=(

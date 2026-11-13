@@ -310,3 +310,34 @@ def configured_host(config, accessible: bool = True, session_groups=("vlabe", "r
         modes={str(config.config_home): "700"},
         runner=FakeRunner(),
     )
+
+
+# -- image fixtures ----------------------------------------------------------
+def png_bytes(width: int, height: int, gradient: bool = False, level: int = 9) -> bytes:
+    """A valid 8-bit RGB PNG built with zlib only.
+
+    ``gradient=False`` produces a uniform (blank) frame: a valid file with no
+    content, which is exactly what the output validator has to reject.
+    """
+    import struct
+    import zlib
+
+    raw = bytearray()
+    for y in range(height):
+        raw.append(0)  # filter type 0
+        for x in range(width):
+            if gradient:
+                raw += bytes((x * 255 // max(width - 1, 1), y * 255 // max(height - 1, 1), 128))
+            else:
+                raw += b"\x00\x00\x00"
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload))
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), level))
+        + chunk(b"IEND", b"")
+    )

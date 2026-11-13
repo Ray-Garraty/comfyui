@@ -1,8 +1,21 @@
 """End-to-end test for generate.sh.
 
-Pipes all interactive answers into generate.sh and verifies that images are
-produced in the output directory. Requires ComfyUI running and model files
-present on disk — not a unit test, run manually before releases.
+Runs the real script against a real ComfyUI and a real model, then validates
+what landed on disk. The test is written so that it cannot hide the bugs it is
+supposed to catch:
+
+* it does **not** inject ``PYTHONPATH`` — building the environment is
+  ``generate.sh``'s job, and injecting ``comfy_kitchen_config`` here used to
+  hide the fact that a server started by the script ran without
+  ``sitecustomize`` (int8 models then failed with HIPBLAS_STATUS_INVALID_VALUE);
+* it validates the produced image with ``comfyprov.smoke.check_image``, which
+  rejects blank frames — a 512x512 PNG of pure black is a valid file, and
+  accepting it cements broken output;
+* on failure it prints the tail of the generator log and the launcher log, so a
+  red run explains itself instead of only failing an assertion.
+
+Not a unit test: it needs the models and a working GPU. Run with
+``./provision.sh verify --full`` or ``pytest -m e2e``.
 """
 
 from __future__ import annotations
@@ -13,79 +26,72 @@ from pathlib import Path
 
 import pytest
 
+from comfyprov.smoke import validate_outputs
+
 INSTALL_DIR = Path(__file__).resolve().parents[2]
 GENERATE_SH = INSTALL_DIR / "generate.sh"
 OUTPUT_DIR = INSTALL_DIR / "output"
+LOG_DIR = INSTALL_DIR / "logs"
+
+
+def _tail(path: Path, lines: int = 40) -> str:
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return f"<{path}: unreadable>"
+    return "\n".join(content[-lines:])
+
+
+def _diagnostics() -> str:
+    return (
+        f"\n--- {LOG_DIR / 'generate.log'} ---\n{_tail(LOG_DIR / 'generate.log')}\n"
+        f"\n--- {LOG_DIR / 'comfyui-start.log'} ---\n{_tail(LOG_DIR / 'comfyui-start.log')}\n"
+    )
+
+
+# Interactive answers, in prompt order: model, CLIP, VAE, size, count, steps,
+# cfg, sampler, scheduler, seed, prompt, negative prompt.
+ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", "a cute cat", ""]) + "\n"
 
 
 @pytest.mark.e2e
-def test_generate_e2e_defaults() -> None:
-    """Full generation with default settings and a simple prompt."""
+def test_generate_sh_produces_a_non_blank_image() -> None:
     if not GENERATE_SH.is_file():
         pytest.skip(f"{GENERATE_SH} not found")
 
-    # Pipe answers for all interactive prompts:
-    #   1        -> select model #1
-    #   1        -> select CLIP model #1
-    #   1        -> select VAE model #1
-    #   512x512  -> image size (small for fast test)
-    #   1        -> count
-    #   4        -> steps
-    #   1.0      -> cfg
-    #   1        -> sampler #1 (euler)
-    #   1        -> scheduler #1 (simple)
-    #   -1       -> seed (random)
-    #   a cute cat -> prompt
-    #            -> negative prompt (empty)
-    stdin_input = (
-        "\n".join(
-            [
-                "1",
-                "1",
-                "1",
-                "512x512",
-                "1",
-                "4",
-                "1.0",
-                "1",
-                "1",
-                "-1",
-                "a cute cat",
-                "",
-            ]
-        )
-        + "\n"
-    )
-
-    # Clean output dir before test
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     before = set(OUTPUT_DIR.iterdir())
 
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(INSTALL_DIR / "provision" / "lib") + os.pathsep + str(INSTALL_DIR / "comfy_kitchen_config")
+    # The script must establish this itself; see the module docstring.
+    env.pop("PYTHONPATH", None)
 
     result = subprocess.run(
         ["bash", str(GENERATE_SH)],
-        input=stdin_input,
+        input=ANSWERS,
         text=True,
         capture_output=True,
-        timeout=600,
+        timeout=900,
         env=env,
     )
 
-    # Print output for debugging on failure
     if result.returncode != 0:
-        print("STDOUT:", result.stdout)
-        print("STDERR:", result.stderr)
+        pytest.fail(
+            f"generate.sh exited {result.returncode}\n"
+            f"stdout:\n{result.stdout[-2000:]}\nstderr:\n{result.stderr[-2000:]}{_diagnostics()}"
+        )
 
-    assert result.returncode == 0, f"generate.sh failed: {result.stderr}"
+    created = [path for path in set(OUTPUT_DIR.iterdir()) - before if path.suffix == ".png"]
+    assert created, f"no PNG was created in {OUTPUT_DIR}{_diagnostics()}"
 
-    after = set(OUTPUT_DIR.iterdir())
-    new_files = after - before
+    problems = validate_outputs([str(image) for image in created])
+    assert not problems, "generator produced unusable images:\n  " + "\n  ".join(problems) + _diagnostics()
 
-    # At least one new image file should appear
-    image_files = [f for f in new_files if f.suffix in (".png", ".jpg", ".jpeg", ".webp")]
-    assert len(image_files) >= 1, f"No new images found in {OUTPUT_DIR}"
+    # The int8 patches only work when the launcher exports comfy_kitchen_config;
+    # without them the run fails on hipblasLt, so this is the behavioural proof
+    # that the environment was built by the scripts, not by the test.
+    assert "[sitecustomize]" in _tail(LOG_DIR / "comfyui-start.log", 200), (
+        f"the server ran without sitecustomize (int8 patches inactive){_diagnostics()}"
+    )
 
-    # Keep generated files on disk so the user can inspect them
-    print(f"Generated test image(s): {sorted(f.name for f in image_files)}")
+    print(f"generated: {sorted(path.name for path in created)}")

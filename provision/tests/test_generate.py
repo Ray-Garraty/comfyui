@@ -13,6 +13,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from helpers import png_bytes
+
 from comfyprov.generate import (
     ComfyUIClient,
     GenerationSettings,
@@ -292,14 +294,45 @@ class TestRunGeneration(unittest.TestCase):
                 ]
             }
         }
-        fake.download_image.return_value = b"IMAGE-BYTES"
+        fake.download_image.return_value = png_bytes(32, 32, gradient=True)
 
         with tempfile.TemporaryDirectory() as tmp:
             saved = run_generation(fake, settings, tmp)
             self.assertEqual(len(saved), 1)
             out_file = Path(tmp) / "0001.png"
             self.assertTrue(out_file.is_file())
-            self.assertEqual(out_file.read_bytes(), b"IMAGE-BYTES")
+            self.assertEqual(out_file.read_bytes(), fake.download_image.return_value)
+
+    def test_blank_image_is_an_error(self) -> None:
+        """A black 512x512 PNG is a valid file and worthless output."""
+        settings = GenerationSettings(
+            model="model.safetensors",
+            clip_model="clip.safetensors",
+            vae_model="vae.safetensors",
+            width=512,
+            height=512,
+            count=1,
+            steps=4,
+            cfg=1.0,
+            sampler="euler",
+            scheduler="simple",
+            seed=1,
+            prompt="hi",
+            neg_prompt="",
+            use_tiled_vae=False,
+            tile_size=512,
+        )
+        fake = mock.Mock(spec=ComfyUIClient)
+        fake.queue_prompt.return_value = "p1"
+        fake.wait_for_completion.return_value = {
+            "7": {"images": [{"filename": "blank.png", "subfolder": "", "type": "output"}]}
+        }
+        fake.download_image.return_value = png_bytes(512, 512, level=0)
+
+        with tempfile.TemporaryDirectory() as tmp, self.assertRaises(RuntimeError) as caught:
+            run_generation(fake, settings, tmp)
+        self.assertIn("blank", str(caught.exception))
+        self.assertIn("blank.png", str(caught.exception))
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
+from .smoke import check_image
+
 # ---------------------------------------------------------------------------
 # Output: terminal + log file without interactive latency
 # ---------------------------------------------------------------------------
@@ -485,6 +487,11 @@ def run_generation(
                 data = client.download_image(filename, subfolder, ftype)
                 out_path = out_dir / filename
                 out_path.write_bytes(data)
+                ok, detail = check_image(str(out_path))
+                if not ok:
+                    # A 512x512 PNG of pure black is a valid file and no image:
+                    # report it now instead of counting it as a success.
+                    raise RuntimeError(f"{out_path}: {detail}")
                 saved.append(GeneratedImage(path=str(out_path), filename=filename))
 
     return saved

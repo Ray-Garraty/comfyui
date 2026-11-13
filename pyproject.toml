@@ -15,4 +15,5 @@ typeCheckingMode = "basic"
 
 [tool.pytest.ini_options]
 testpaths = ["provision/tests"]
+markers = ["e2e: end-to-end test that starts ComfyUI and generates a real image"]
 pythonpath = ["provision/lib", "provision/tests"]
