@@ -42,6 +42,7 @@ def host_after_system(config, plan_obj):
     modes = {}
     sizes = {}
     swap = set()
+    listdir = base_listdir(config)
     packages = set()
     sysctl = {"vm.max_map_count": 65530, "fs.inotify.max_user_watches": 8192}
     mounted = set()
@@ -60,6 +61,10 @@ def host_after_system(config, plan_obj):
             )
         elif action.kind == "apt_install":
             packages.update(action.params["packages"])
+        elif action.id == "journald-dir":
+            dirs.add(action.params["argv"][-1])
+        elif action.id == "watchdog-load":
+            listdir["/sys/class/watchdog"] = ["watchdog0"]
         elif action.id == "sysctl-apply":
             sysctl.update(layout.SYSCTL_VALUES)
         elif action.id == "crash-sysctl":
@@ -79,7 +84,7 @@ def host_after_system(config, plan_obj):
         sizes=sizes,
         swap=swap,
         perms=base_perms(),
-        listdir_map=base_listdir(config),
+        listdir_map=listdir,
         packages=packages,
         apt=frozenset(layout.APT_REQUIRED + layout.APT_OPTIONAL),
         sysctl=sysctl,
@@ -406,6 +411,26 @@ class SwapPlanTests(PlanTestCase):
             {"swap-allocate", "swap-chmod", "swap-mkswap", "swap-on", "swap-fstab"},
         )
         self.assertEqual(plan_obj.status, "pending")
+
+    def test_active_swap_is_not_reformatted(self) -> None:
+        """mkswap on a live swapfile fails: "is mounted; will not make swapspace"."""
+        path = str(self.config.swap_file)
+        probe = FakeProbe(
+            files={**base_files(self.config), "/etc/fstab": f"{path} none swap sw 0 0\n"},
+            dirs=base_dirs(self.config),
+            perms=base_perms(),
+            listdir_map=base_listdir(self.config),
+            sizes={path: layout.parse_size(self.config.swap_size)},
+            modes={path: "600"},
+            swap=(path,),
+            session_groups=("vlabe",),
+            runner=FakeRunner([("blkid", RunResult(1, "", "no output"))]),
+        )
+        plan_obj = plan(self.config, probe, "swap")
+        pending = {action.id for action in plan_obj.pending}
+        self.assertNotIn("swap-mkswap", pending)
+        self.assertNotIn("swap-on", pending)
+        self.assertEqual(plan_obj.status, "ok")
 
     def test_swap_size_parsing(self) -> None:
         self.assertEqual(layout.parse_size("16G"), 16 * 1024**3)

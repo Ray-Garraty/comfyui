@@ -125,7 +125,7 @@ Generated at provisioning time (do not edit by hand):
 ./provision.sh auth
 ./provision.sh doctor
 ./provision.sh update [--force]
-./provision.sh test                # bash -n, shellcheck, python tests
+./provision.sh test                # bash -n, shellcheck, ruff, pyright, tests + e2e
 ```
 
 Global flags: `--dry-run`, `--yes`, `--force`, `--full`, `--no-color`.
@@ -253,8 +253,31 @@ optional `--out FILE`.
 - Hooks are versioned in `.githooks/` and enabled with
   `git config core.hooksPath .githooks`.
 - `.githooks/pre-commit` calls `./provision.sh test`, which runs `bash -n`,
-  `shellcheck`, `ruff format --check`, `ruff check`, `pyright` and `pytest`.
-  Keep that single entry point; do not duplicate the check list in the hook.
+  `shellcheck`, `ruff format --check`, `ruff check`, `pyright`, `pytest` and
+  the mandatory e2e test. Keep that single entry point; do not duplicate the
+  check list in the hook.
+- The unit pytest pass runs with `-m "not e2e"`; the e2e marker is run exactly
+  once, afterwards. Never merge them back into one full-suite run: every extra
+  ComfyUI start/stop cycle is GPU context churn on this amdgpu stack
+  (`reports/2026-11-13-crash-report.md` §4.5 — 4 of 7 resets landed inside the
+  double cycle). Pinned by `provision/tests/test_commit_gate.py`.
+- **Business requirement: the e2e test cannot be skipped for a commit.** No
+  option, no condition, no environment variable, no "later", no excuse.
+  A missing model, a missing server, a broken or burnt GPU, a tight deadline —
+  all of them make the commit fail, because that is the state of the machine
+  and hiding it is the bug. `provision.sh test` counts a skipped, deselected,
+  empty or injected-option e2e run as a failure, and
+  `provision/tests/test_generate_e2e.py` fails instead of skipping on a
+  missing precondition.
+- **Bypassing the gate is forbidden:** `git commit --no-verify`,
+  `git -c core.hooksPath=/dev/null commit`, temporarily disabling the hook,
+  commenting out the failing step or committing on another branch "for now".
+  If the gate is red, fix the tree or do not commit.
+  `provision/tests/test_commit_gate.py` pins the hook contents so the rule
+  cannot be edited away silently.
+- **Penalty: a ban.** Anyone who skips the e2e test, disables the gate or
+  pushes a commit that did not pass it loses write access to the repository.
+  There is no warning level, no first time, no appeal: the rule is absolute.
 
 **Commit only when the user explicitly asks for a commit.** Never create
 commits on your own initiative, and never split work into a stream of small

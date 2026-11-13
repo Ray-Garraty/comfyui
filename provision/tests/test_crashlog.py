@@ -83,6 +83,66 @@ class SystemLoggingTests(unittest.TestCase):
         ids = {action.id for action in plan.actions}
         self.assertIn(f"write:{layout.JOURNALD_DROPIN}", ids)
 
+    def test_journald_drop_in_directory_is_created_first(self) -> None:
+        """Ubuntu has no /etc/systemd/journald.conf.d: tee alone cannot create it."""
+        probe = clean_host(self.config, packages=frozenset(layout.APT_REQUIRED) | {"rsyslog"})
+        plan = self.plan(probe)
+        ids = [action.id for action in plan.actions]
+        self.assertIn("journald-dir", ids)
+        self.assertLess(ids.index("journald-dir"), ids.index(f"write:{layout.JOURNALD_DROPIN}"))
+        action = next(item for item in plan.actions if item.id == "journald-dir")
+        self.assertTrue(action.sudo)
+        self.assertEqual(action.params["argv"][:2], ["install", "-d"])
+
+    def test_watchdog_turns_a_freeze_into_a_panic_fast_enough(self) -> None:
+        """The last freeze lasted ~52 s; a 60 s hung_task timeout is useless."""
+        self.assertLessEqual(layout.CRASH_SYSCTL_VALUES["kernel.hung_task_timeout_secs"], 20)
+        self.assertLessEqual(layout.CRASH_SYSCTL_VALUES["kernel.watchdog_thresh"], 10)
+
+    def test_watchdog_module_matches_the_chipset(self) -> None:
+        """sp5100_tco is an AMD part; this board is an Intel B150 -> iTCO_wdt."""
+        intel = clean_host(
+            self.config,
+            packages=frozenset(layout.APT_REQUIRED) | {"rsyslog"},
+            runner=FakeRunner([("lspci", RunResult(0, "00:1f.0 ISA bridge: Intel Corporation B150 Chipset\n", ""))]),
+        )
+        content = next(
+            a.params["content"] for a in self.plan(intel).actions if a.id == f"write:{layout.MODULES_LOAD_FILE}"
+        )
+        self.assertIn("iTCO_wdt", content)
+
+        amd = clean_host(
+            self.config,
+            packages=frozenset(layout.APT_REQUIRED) | {"rsyslog"},
+            runner=FakeRunner([("lspci", RunResult(0, "00:14.3 ISA bridge: Advanced Micro Devices SB800\n", ""))]),
+        )
+        content = next(
+            a.params["content"] for a in self.plan(amd).actions if a.id == f"write:{layout.MODULES_LOAD_FILE}"
+        )
+        self.assertIn("sp5100_tco", content)
+
+    def test_wdat_backend_wins_when_the_firmware_exposes_it(self) -> None:
+        probe = clean_host(
+            self.config,
+            packages=frozenset(layout.APT_REQUIRED) | {"rsyslog"},
+            listdir_map={**base_listdir(self.config), "/sys/bus/acpi/devices": ["WDAT0001", "PNP0A08"]},
+        )
+        content = next(
+            a.params["content"] for a in self.plan(probe).actions if a.id == f"write:{layout.MODULES_LOAD_FILE}"
+        )
+        self.assertIn("wdat_wdt", content)
+
+    def test_hardware_watchdog_is_planned(self) -> None:
+        probe = clean_host(self.config, packages=frozenset(layout.APT_REQUIRED) | {"rsyslog"})
+        plan = self.plan(probe)
+        ids = {action.id for action in plan.actions}
+        self.assertIn(f"write:{layout.MODULES_LOAD_FILE}", ids)
+        self.assertIn(f"write:{layout.WATCHDOG_DROPIN}", ids)
+        self.assertIn("watchdog-load", ids)
+        self.assertIn("RuntimeWatchdogSec=", layout.WATCHDOG_CONTENT)
+        self.assertIn("watchdog", layout.modules_load_content("iTCO_wdt"))
+        self.assertEqual(layout.watchdog_module("00:1f.0 ISA bridge: Intel B150", False)[0], "iTCO_wdt")
+
     def test_lockups_become_panics(self) -> None:
         content = layout.CRASH_SYSCTL_CONTENT
         self.assertIn("kernel.hardlockup_panic = 1", content)

@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
 # Pre-commit gate: ruff (format + lint), pyright, pytest, shellcheck, bash -n.
 # Installed via `git config core.hooksPath .githooks`; see AGENTS.md.
+#
+# Business requirement: the e2e test is mandatory for every commit. There is
+# no option, no condition and no excuse to skip it — not a missing model, not a
+# dead GPU, not a deadline. Bypassing this gate (`git commit --no-verify`,
+# `git -c core.hooksPath=...`, quoting the failed step, temporarily disabling
+# the hook) is forbidden. A red run means the commit does not happen.
+#
+# Penalty for a violation: a ban — permanent loss of write access to the
+# repository. No warning, no first time, no appeal. Not a joke.
 set -Eeuo pipefail
 
 repo_root=$(git rev-parse --show-toplevel)
 cd "$repo_root"
 
 # One command owns the whole check matrix, so the hook cannot drift from
-# `./provision.sh test` or from CI.
+# `./provision.sh test` or from CI. It runs unconditionally: no flags, no
+# environment switch and no "fast path" may be added around this call.
 ./provision.sh test

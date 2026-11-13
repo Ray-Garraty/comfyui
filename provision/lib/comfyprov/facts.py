@@ -68,7 +68,11 @@ class Facts:
     fstab: str
     desktop_shortcut: Path
     pstore: tuple[str, ...]
+    dirs: frozenset[str]
     pstore_enabled: bool
+    watchdog_present: bool
+    isa_bridge: str
+    acpi_wdat: bool
 
     # -- helpers -------------------------------------------------------------
     def group(self, name: str) -> gpu.GroupFact | None:
@@ -79,6 +83,9 @@ class Facts:
 
     def file(self, key: str) -> str | None:
         return self.files.get(key)
+
+    def dir_exists(self, path) -> bool:
+        return str(path) in self.dirs
 
     def stamp(self, key: str) -> str | None:
         return self.stamps.get(key)
@@ -195,12 +202,21 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
     state = config.state_dir
     stamps = {name: probe.read_text(state / filename) for name, filename in layout.STAMPS.items()}
     shortcut = desktop_shortcut(probe)
+    isa_bridge = ""
+    for line in probe.run(["lspci"], timeout=20).out.splitlines():
+        if "ISA bridge" in line:
+            isa_bridge = line
+            break
+    acpi_wdat = any(name.startswith("WDAT") for name in probe.listdir("/sys/bus/acpi/devices"))
+
     pstore_state = probe.run(["systemctl", "is-enabled", layout.PSTORE_UNIT], timeout=15)
     pstore_enabled = pstore_state.ok and pstore_state.out.strip() in layout.PSTORE_ENABLED_STATES
     files = {
         "sysctl": probe.read_text(layout.SYSCTL_FILE),
         "crash_sysctl": probe.read_text(layout.CRASH_SYSCTL_FILE),
         "journald": probe.read_text(layout.JOURNALD_DROPIN),
+        "watchdog": probe.read_text(layout.WATCHDOG_DROPIN),
+        "modules_load": probe.read_text(layout.MODULES_LOAD_FILE),
         "rsyslog": probe.read_text(layout.RSYSLOG_DROPIN),
         "udev": probe.read_text(layout.UDEV_FILE),
         "constraints": probe.read_text(state / "constraints.txt"),
@@ -258,7 +274,19 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
         fstab=probe.read_text("/etc/fstab") or "",
         desktop_shortcut=shortcut,
         pstore=tuple(probe.listdir(layout.PSTORE_DIR)),
+        dirs=frozenset(
+            str(path)
+            for path in (
+                layout.JOURNALD_DROPIN.parent,
+                layout.RSYSLOG_DROPIN.parent,
+                layout.CRASH_SYSCTL_FILE.parent,
+            )
+            if probe.is_dir(path)
+        ),
         pstore_enabled=pstore_enabled,
+        watchdog_present=bool(probe.listdir("/sys/class/watchdog")),
+        isa_bridge=isa_bridge,
+        acpi_wdat=acpi_wdat,
     )
 
 

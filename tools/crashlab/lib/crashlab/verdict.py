@@ -7,7 +7,13 @@ from datetime import UTC, datetime
 
 from . import parsers
 
+# Seconds after which a signature is context, not a cause.
+STALE_SIGNATURE_SECONDS = 300
+
+FREEZE_GAP_SECONDS = 30
+
 CAUSE_ORDER = (
+    "hardware",
     "kernel-lockup",
     "gpu-hang",
     "oom",
@@ -32,8 +38,12 @@ class Evidence:
     logs: list[parsers.LogTail] = field(default_factory=list)
     sessions: list[parsers.Session] = field(default_factory=list)
     pstore: list[tuple[str, str]] = field(default_factory=list)
+    journal_last: str = ""
+    config: dict[str, str] = field(default_factory=dict)
     gpu: list[str] = field(default_factory=list)
     gdb_frames: dict[int, list[str]] = field(default_factory=dict)
+    boot_end: datetime | None = None
+    log_mtime: datetime | None = None
     history: list[dict] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -54,9 +64,79 @@ class Verdict:
         }
 
 
+def signature_age(ev: Evidence, moment: datetime | None) -> float | None:
+    """Seconds between the newest matching line and the end of the boot."""
+    if ev.boot_end is None or moment is None:
+        return None
+    return (ev.boot_end - moment).total_seconds()
+
+
+def newest_signature(ev: Evidence) -> datetime | None:
+    stamps: list[datetime] = []
+    for samples in ev.samples.values():
+        for line in samples:
+            stamp = parsers.parse_stamp(line.split(" ", 1)[0])
+            if stamp:
+                stamps.append(stamp)
+    return max(stamps) if stamps else None
+
+
+def journal_gap(ev: Evidence) -> float | None:
+    """Seconds between the last journal entry and the last process log write.
+
+    journald is a normal process: if it stopped writing long before the
+    application did, the machine stopped scheduling rather than crashing.
+    """
+    if ev.boot_end is None or ev.log_mtime is None:
+        return None
+    gap = (ev.log_mtime - ev.boot_end).total_seconds()
+    return gap if gap > 0 else None
+
+
 def decide(ev: Evidence) -> Verdict:
     """Map the evidence to one cause. Ordered by specificity, not by guesswork."""
     counts = ev.counts
+    gap = journal_gap(ev)
+    age = signature_age(ev, newest_signature(ev))
+    fresh_watchdog = counts.get("watchdog lockup")
+    if counts.get("kernel panic"):
+        return Verdict(
+            "kernel-panic",
+            f"kernel panic: {_panic_reason(ev)}",
+            _pick(ev, "kernel panic") + _panic_frames(ev),
+            ["read the panic block above", "crashlab coredump <pid> for the process side"],
+        )
+
+    if gap is not None and gap > FREEZE_GAP_SECONDS and not fresh_watchdog:
+        return Verdict(
+            "freeze",
+            f"the system stopped scheduling {int(gap)} s before the last process log write: "
+            "journald went silent while the application kept logging",
+            [f"journal went silent {int(gap)} s before the last log write"],
+            [
+                "lower kernel.watchdog_thresh and kernel.hung_task_timeout_secs so the freeze panics",
+                "load the hardware watchdog (sp5100_tco) and set RuntimeWatchdogSec",
+            ],
+        )
+
+    if age is not None and age > STALE_SIGNATURE_SECONDS:
+        # The last matching line is minutes older than the reset: it explains
+        # what the machine was doing, not what killed it. Say so instead of
+        # promoting a stale signature to a cause.
+        recent = [
+            f"{name} x{hits} (last one {int(age // 60)} min before the reset)"
+            for name, hits in sorted(counts.items(), key=lambda item: -item[1])
+        ]
+        return Verdict(
+            "silent-reset",
+            "the machine died without a fresh kernel signature"
+            + (f"; earlier in this boot: {', '.join(recent[:3])}" if recent else ""),
+            recent[:4] + ([f"last kernel line: {ev.kernel[-1][:160]}"] if ev.kernel else []),
+            [
+                "apply the durable logging configuration (./provision.sh system, run by the user)",
+                "compare the boot end time with logs/session.log",
+            ],
+        )
 
     if counts.get("hardware error") or counts.get("thermal"):
         return Verdict(
@@ -151,6 +231,38 @@ def decide(ev: Evidence) -> Verdict:
     )
 
 
+def _panic_reason(ev: Evidence) -> str:
+    for line in reversed(ev.kernel):
+        if "Kernel panic" in line:
+            return line.split("kernel:", 1)[-1].strip()[:160]
+    return "see the trace below"
+
+
+def _panic_frames(ev: Evidence, limit: int = 8) -> list[str]:
+    """RIP plus the Call Trace block: the two things that name the culprit."""
+    frames: list[str] = []
+    for line in ev.kernel:
+        body = line.split("kernel:", 1)[-1].strip()
+        if "RIP:" in body:
+            frames.append(body[:170])
+        if len(frames) >= limit:
+            return frames
+    in_trace = False
+    for line in ev.kernel:
+        body = line.split("kernel:", 1)[-1].strip()
+        if body.startswith("Call Trace"):
+            in_trace = True
+            continue
+        if not in_trace:
+            continue
+        if body.startswith("---[") or body.startswith("</TASK>") or not body:
+            break
+        frames.append(body[:170])
+        if len(frames) >= limit:
+            break
+    return frames
+
+
 def _pick(ev: Evidence, *names: str) -> list[str]:
     lines: list[str] = []
     for name in names:
@@ -224,6 +336,13 @@ def render(ev: Evidence, verdict: Verdict, generated: str | None = None) -> str:
         out.append("")
         out.append("kernel tail:")
         out.extend(f"  {line[:170]}" for line in ev.kernel[-15:])
+    if ev.config or ev.journal_last:
+        out.append("")
+        out.append("logging chain (why evidence may be missing):")
+        for key, value in ev.config.items():
+            out.append(f"  {key}: {value}")
+        if ev.journal_last:
+            out.append(f"  last journal entry: {ev.journal_last[:120]}")
     if verdict.next_steps:
         out.append("")
         out.append("next steps:")

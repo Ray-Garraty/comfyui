@@ -16,6 +16,11 @@ supposed to catch:
 
 Not a unit test: it needs the models and a working GPU. Run with
 ``./provision.sh verify --full`` or ``pytest -m e2e``.
+
+Business requirement: this test is mandatory for every commit. It must never
+skip — not for a missing script, a missing model, a dead GPU or any other
+reason. A skip hides exactly the breakage the test exists to catch, so every
+unmet precondition is turned into a failure below and in ``provision.sh test``.
 """
 
 from __future__ import annotations
@@ -56,8 +61,10 @@ ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", 
 
 @pytest.mark.e2e
 def test_generate_sh_produces_a_non_blank_image() -> None:
+    # A skip would let the commit through with nothing tested, so a missing
+    # script is a failure. There is no option and no excuse to skip e2e.
     if not GENERATE_SH.is_file():
-        pytest.skip(f"{GENERATE_SH} not found")
+        pytest.fail(f"{GENERATE_SH} not found; e2e tests cannot be skipped")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     before = set(OUTPUT_DIR.iterdir())

@@ -123,7 +123,8 @@ CRASH_SYSCTL_VALUES: dict[str, int] = {
     "kernel.hardlockup_panic": 1,
     "kernel.softlockup_panic": 1,
     "kernel.hung_task_panic": 1,
-    "kernel.hung_task_timeout_secs": 60,
+    "kernel.watchdog_thresh": 5,
+    "kernel.hung_task_timeout_secs": 15,
     "kernel.panic_on_oops": 1,
     "kernel.panic": 10,
 }
@@ -136,6 +137,46 @@ CRASH_SYSCTL_CONTENT = (
     + "".join(f"{key} = {value}\n" for key, value in CRASH_SYSCTL_VALUES.items())
     + "# Do not rate limit kernel messages to user space.\nkernel.printk_devkmsg = on\n"
 )
+
+# The last real freeze lasted ~52 s and produced nothing: hung_task fired at
+# 60 s, too late, and no CPU was hard-locked. Lower the thresholds so a freeze
+# turns into a panic while the box is still able to write it down.
+# Hardware watchdog drivers, in order of preference. The board decides: the
+# TCO block belongs to the chipset (Intel LPC/eSPI -> iTCO_wdt, AMD
+# SP5100/SB800 -> sp5100_tco), or the firmware exposes an ACPI WDAT device.
+WATCHDOG_CANDIDATES: tuple[tuple[str, str], ...] = (
+    ("wdat_wdt", "ACPI WDAT firmware watchdog"),
+    ("iTCO_wdt", "Intel chipset TCO"),
+    ("sp5100_tco", "AMD SP5100/SB800 chipset TCO"),
+    ("nct6775", "Nuvoton SuperIO watchdog (motherboard)"),
+)
+MODULES_LOAD_FILE = Path("/etc/modules-load.d/comfyui-watchdog.conf")
+
+
+def watchdog_module(isa_bridge: str, wdat: bool) -> tuple[str, str]:
+    """Pick the driver that matches this board: (module, reason)."""
+    if wdat:
+        return WATCHDOG_CANDIDATES[0]
+    lowered = isa_bridge.lower()
+    if "intel" in lowered:
+        return WATCHDOG_CANDIDATES[1]
+    if "amd" in lowered or "advanced micro devices" in lowered:
+        return WATCHDOG_CANDIDATES[2]
+    return WATCHDOG_CANDIDATES[3]
+
+
+def modules_load_content(module: str) -> str:
+    return f"# ComfyUI / hardware watchdog for freeze detection\n{module}\n"
+
+
+WATCHDOG_DROPIN = Path("/etc/systemd/system.conf.d/99-comfyui-watchdog.conf")
+WATCHDOG_CONTENT = """# ComfyUI / reboot when the kernel stops scheduling
+# systemd keeps the hardware watchdog fed; if PID 1 stops running, the chipset
+# resets the machine instead of leaving it frozen forever.
+[Manager]
+RuntimeWatchdogSec=30s
+RebootWatchdogSec=5min
+"""
 
 PSTORE_DIR = Path("/sys/fs/pstore")
 PSTORE_UNIT = "systemd-pstore.service"

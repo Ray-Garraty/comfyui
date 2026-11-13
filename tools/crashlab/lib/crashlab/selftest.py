@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 
 from . import parsers
 from . import verdict as verdict_mod
+from .host import Host
 
 LIST_BOOTS = """\
  -2 b544c54e5a88468aac0af33cbe658f1c Fri 2026-11-13 19:45:20 MSK Fri 2026-11-13 21:50:31 MSK
@@ -51,6 +53,14 @@ SESSION_LOG = """\
 """
 
 
+PAGE_FAULT = [
+    "2026-11-13T22:18:52+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0: [gfxhub] page fault (src_id:0 ring:40)",
+    "2026-11-13T22:18:52+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0:  Process python pid 7904 thread python pid 7904",
+    "2026-11-13T22:18:52+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0: GCVM_L2_PROTECTION_FAULT_STATUS:0x00841050",
+    "2026-11-13T22:18:52+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0:          Faulty UTCL2 client ID: TCP (0x8)",
+]
+
+
 class BootTests(unittest.TestCase):
     def test_boot_list_is_parsed(self) -> None:
         boots = parsers.parse_list_boots(LIST_BOOTS)
@@ -71,6 +81,10 @@ class SignatureTests(unittest.TestCase):
         self.assertEqual(counts["framebuffer pin failed"], 2)
         samples = parsers.signature_samples(KERNEL.splitlines(), limit=1)
         self.assertIn("pin failed", samples["amdgpu pin failed"][0])
+
+    def test_gpu_page_fault_is_recognised(self) -> None:
+        counts = parsers.count_signatures(PAGE_FAULT)
+        self.assertEqual(counts.get("GPU page fault"), 3)
 
     def test_reset_is_not_confused_with_oom(self) -> None:
         counts = parsers.count_signatures(["kernel: Out of memory: Killed process 42"])
@@ -116,6 +130,78 @@ class CoredumpTests(unittest.TestCase):
         self.assertEqual(parsers.blame(["#0 0x1 in main () from /usr/bin/app"]), "")
 
 
+PANIC = """\
+2026-11-13T22:54:12+03:00 vlabe-PC kernel: BUG: unable to handle page fault for address: ffffc900
+2026-11-13T22:54:12+03:00 vlabe-PC kernel: Oops: 0000 [#1] PREEMPT SMP NOPTI
+2026-11-13T22:54:12+03:00 vlabe-PC kernel: RIP: 0010:amdgpu_vm_bo_update+0x1a/0x40 [amdgpu]
+2026-11-13T22:54:12+03:00 vlabe-PC kernel: Kernel panic - not syncing: Fatal exception
+2026-11-13T22:54:12+03:00 vlabe-PC kernel: Call Trace:
+2026-11-13T22:54:12+03:00 vlabe-PC kernel:  <TASK>
+2026-11-13T22:54:12+03:00 vlabe-PC kernel:  amdgpu_vm_bo_update+0x1a/0x40 [amdgpu]
+2026-11-13T22:54:12+03:00 vlabe-PC kernel:  amdgpu_gem_va_ioctl+0x2b2/0x3f0 [amdgpu]
+2026-11-13T22:54:12+03:00 vlabe-PC kernel:  </TASK>
+2026-11-13T22:54:13+03:00 vlabe-PC kernel: ---[ end trace 0000000000000000 ]---
+"""
+
+
+class PanicTests(unittest.TestCase):
+    def test_panic_is_recognised_and_wins_over_a_freeze(self) -> None:
+        ev = verdict_mod.Evidence(
+            kernel=PANIC.splitlines(),
+            boot_end=datetime(2026, 11, 13, 22, 54, 12),
+            journal_last="2026-11-13T22:54:12+03:00 vlabe-PC kernel: Kernel panic - not syncing",
+            logs=[parsers.LogTail("comfyui-debug.log", 0.0, ["x"], 0)],
+        )
+        ev.log_mtime = datetime(2026, 11, 13, 22, 55, 4)
+        ev.counts = parsers.count_signatures(ev.kernel)
+        ev.samples = parsers.signature_samples(ev.kernel)
+        result = verdict_mod.decide(ev)
+        self.assertEqual(result.cause, "kernel-panic")
+        self.assertTrue(any("RIP:" in line for line in result.evidence), result.evidence)
+        self.assertTrue(any("amdgpu_gem_va_ioctl" in line for line in result.evidence), result.evidence)
+
+
+class WindowTests(unittest.TestCase):
+    def test_logs_from_a_later_boot_are_excluded(self) -> None:
+        """A log written after the crashed boot must not inflate the freeze gap."""
+        logs = [
+            parsers.LogTail("old.log", datetime(2026, 11, 13, 23, 6, 40).timestamp(), ["a"]),
+            parsers.LogTail("new.log", datetime(2026, 11, 13, 23, 9, 45).timestamp(), ["b"]),
+        ]
+        kept = parsers.logs_in_window(
+            logs,
+            datetime(2026, 11, 13, 22, 55, 30),
+            datetime(2026, 11, 13, 23, 6, 57),
+        )
+        self.assertEqual([log.name for log in kept], ["old.log"])
+
+
+class FreezeTests(unittest.TestCase):
+    def test_gap_between_journal_and_process_log_is_a_freeze(self) -> None:
+        """journald stopped 52 s before the last process write: the box stopped scheduling."""
+        ev = verdict_mod.Evidence(
+            journal_last="2026-11-13T22:54:12+03:00 vlabe-PC systemd[1]: something",
+            boot_end=datetime(2026, 11, 13, 22, 54, 12),
+            logs=[parsers.LogTail("comfyui-debug.log", 0.0, ["Trying to load custom node"], 514)],
+        )
+        ev.log_mtime = datetime(2026, 11, 13, 22, 55, 4)
+        result = verdict_mod.decide(ev)
+        self.assertEqual(result.cause, "freeze")
+        self.assertTrue(any("52" in line for line in result.evidence), result.evidence)
+
+    def test_unreadable_pstore_is_not_reported_as_empty(self) -> None:
+        import tempfile
+        from pathlib import Path as P
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = P(tmp) / "pstore"
+            path.mkdir()
+            path.chmod(0o000)
+            names, error = Host().listdir_checked(str(path))
+        self.assertEqual(names, [])
+        self.assertIn("permission", error.lower())
+
+
 class VerdictTests(unittest.TestCase):
     def evidence(self, **kwargs) -> verdict_mod.Evidence:
         ev = verdict_mod.Evidence()
@@ -142,6 +228,18 @@ class VerdictTests(unittest.TestCase):
 
     def test_empty_journal_is_inconclusive(self) -> None:
         self.assertEqual(verdict_mod.decide(self.evidence()).cause, "unlogged")
+
+    def test_stale_signatures_become_context_not_a_verdict(self) -> None:
+        """pin failures 10 minutes before the reset did not cause it by themselves."""
+        kernel = KERNEL.splitlines()
+        ev = self.evidence(kernel=kernel, boot_end=datetime(2026, 11, 13, 22, 42, 57))
+        result = verdict_mod.decide(ev)
+        self.assertEqual(result.cause, "silent-reset")
+        self.assertTrue(any("before the reset" in line for line in result.evidence), result.evidence)
+
+    def test_recent_signatures_keep_their_cause(self) -> None:
+        ev = self.evidence(kernel=KERNEL.splitlines(), boot_end=datetime(2026, 11, 13, 21, 47, 40))
+        self.assertEqual(verdict_mod.decide(ev).cause, "gpu-memory")
 
     def test_silent_reset_names_the_last_log(self) -> None:
         logs = [parsers.LogTail("comfyui.log", 0.0, ["Prompt executed"], 2833)]

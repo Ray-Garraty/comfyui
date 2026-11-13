@@ -15,7 +15,8 @@
 #   ./provision.sh doctor       # print diagnostics
 #   ./provision.sh update       # move ComfyUI/Manager to the configured refs
 #   ./provision.sh swap         # create a 16 GB swap file (opt-in)
-#   ./provision.sh test         # bash -n, shellcheck and the Python unit tests
+#   ./provision.sh test         # bash -n, shellcheck, ruff, pyright and the
+#                               # Python unit + mandatory e2e tests
 #
 # Exit codes: 0 ok, 1 error, 2 usage, 3 reboot/re-login required,
 #             4 missing prerequisite, 5 verification failed.
@@ -310,6 +311,9 @@ cmd_swap() {
 
 cmd_test() {
     local failed=0
+    # Options must not be injectable: nothing may deselect, skip or silence a
+    # test through the environment.
+    unset PYTEST_ADDOPTS PYTEST_PLUGINS
     local script
     for script in "$HERE/provision.sh" "$HERE/start-comfyui.sh" "$HERE"/provision/lib/*.sh; do
         if bash -n "$script"; then
@@ -346,7 +350,12 @@ cmd_test() {
     else
         warn "pyright is not installed; skipping the type check"
     fi
-    if PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m pytest -q "$HERE/provision/tests" 2>/dev/null; then
+    # The e2e test starts a real ComfyUI; it must not run twice per commit
+    # (reports/2026-11-13-crash-report.md §4.5: each extra start/stop cycle is
+    # a GPU context churn on an unstable amdgpu stack). The unit pass deselects
+    # it here, the mandatory e2e pass below runs it exactly once.
+    if PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" \
+        -m pytest -q -m "not e2e" -p no:cacheprovider "$HERE/provision/tests" 2>/dev/null; then
         ok "python tests"
     elif PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m unittest discover \
         -s "$HERE/provision/tests" -t "$HERE/provision/tests"; then
@@ -355,13 +364,28 @@ cmd_test() {
         failed=1
     fi
 
-    # Business requirement: an e2e test failure is a hard fail for any reason
-    # (missing server, missing model, assertion, skip) — it blocks the commit.
-    # No fallback, no warning-only path.
-    if PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m pytest -q -m e2e "$HERE/provision/tests"; then
-        ok "e2e tests"
-    else
+    # Business requirement: the e2e test is mandatory for every commit.
+    # No option, no condition, no excuse skips it: a failure, a skip, an empty
+    # collection or an injected pytest option all block the commit. It runs
+    # even when the GPU is dead or the model is missing — that is exactly what
+    # a red e2e run has to report. `git commit --no-verify` and
+    # `-c core.hooksPath=...` are forbidden for the same reason.
+    # Violation is punished with a ban: permanent loss of write access.
+    unset PYTEST_ADDOPTS PYTEST_PLUGINS
+    local e2e_output="" e2e_rc=0
+    e2e_output=$(PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" \
+        -m pytest -q -m e2e --strict-markers --no-header -rA -p no:cacheprovider \
+        "$HERE/provision/tests" 2>&1) || e2e_rc=$?
+    if [[ $e2e_rc -ne 0 ]]; then
+        printf '%s\n' "$e2e_output"
         failed=1
+    elif ! grep -qE '^PASSED ' <<<"$e2e_output" || grep -qE '^(SKIPPED|XFAIL|XPASS) ' <<<"$e2e_output"; then
+        # pytest exits 0 for a skipped test; the requirement does not.
+        printf '%s\n' "$e2e_output"
+        warn "e2e tests did not run to completion; a skip is a failure"
+        failed=1
+    else
+        ok "e2e tests"
     fi
 
     if bash -n "$HERE/provision/tests/verify_trap_test.sh" && \

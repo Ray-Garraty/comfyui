@@ -24,9 +24,21 @@ SIGNATURES: tuple[tuple[str, re.Pattern[str], int], ...] = (
     ("amdgpu pin failed", re.compile(r"amdgpu .*pin failed"), 1),
     ("framebuffer pin failed", re.compile(r"Failed to pin framebuffer"), 2),
     ("GPU hang/timeout", re.compile(r"amdgpu_job_timedout|ring \S+ timeout|GPU reset"), 9),
-    ("GPU page fault", re.compile(r"amdgpu: .*(VM_L2|page fault|IH ring)"), 9),
+    (
+        "GPU page fault",
+        re.compile(
+            r"\[gfxhub\] page fault|GCVM_L2_PROTECTION_FAULT_STATUS|Faulty UTCL2 client ID"
+            r"|from client 0x[0-9a-f]+ \(UTCL2\)|amdgpu: .*IH ring"
+        ),
+        9,
+    ),
     ("watchdog lockup", re.compile(r"soft lockup|hard LOCKUP|watchdog: BUG|hung_task"), 8),
     ("out of memory", re.compile(r"Out of memory|oom-kill|invoked oom-killer"), 7),
+    (
+        "kernel panic",
+        re.compile(r"Kernel panic - not syncing|BUG: unable to handle|Oops: \[|general protection fault"),
+        11,
+    ),
     ("hardware error", re.compile(r"Hardware Error|Machine check|MCE:|EDAC .*error"), 10),
     ("thermal", re.compile(r"critical temperature|thermal.*throttl"), 10),
     ("PCIe error", re.compile(r"pcieport .*AER|AER: Corrected|PCIe Bus Error"), 6),
@@ -155,6 +167,28 @@ class LogTail:
 def tail_lines(text: str, count: int = 3, width: int = 200) -> list[str]:
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     return [line[:width] for line in lines[-count:]]
+
+
+def logs_in_window(logs: list[LogTail], start: datetime | None, end: datetime | None) -> list[LogTail]:
+    """Keep only logs written while the analysed boot was running.
+
+    Without this a log written by the *next* boot makes the journal look silent
+    for minutes longer than it was, and the freeze gap is nonsense.
+    """
+    if start is None and end is None:
+        return list(logs)
+    kept: list[LogTail] = []
+    for log in logs:
+        moment = datetime.fromtimestamp(log.mtime) if log.mtime else None
+        if moment is None:
+            kept.append(log)
+            continue
+        if start is not None and moment < start:
+            continue
+        if end is not None and moment > end:
+            continue
+        kept.append(log)
+    return kept
 
 
 def zero_tail(data: bytes) -> int:

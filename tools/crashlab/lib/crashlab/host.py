@@ -59,6 +59,19 @@ class Host:
         except OSError:
             return b""
 
+    def listdir_checked(self, path: str | Path) -> tuple[list[str], str]:
+        """Names plus an explanation when the directory cannot be read.
+
+        /sys/fs/pstore is root-only: reporting "no records" without saying that
+        the directory was unreadable turns a blind spot into a false negative.
+        """
+        try:
+            return sorted(os.listdir(self.local(path))), ""
+        except PermissionError as exc:
+            return [], f"permission denied ({exc.strerror})"
+        except OSError as exc:
+            return [], str(exc)
+
     def listdir(self, path: str | Path) -> list[str]:
         try:
             return sorted(os.listdir(self.local(path)))

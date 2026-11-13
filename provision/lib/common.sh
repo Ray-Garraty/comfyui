@@ -18,6 +18,8 @@ set -Eeuo pipefail
 : "${EXIT_REBOOT:=3}"
 : "${EXIT_PREREQ:=4}"
 : "${EXIT_VERIFY:=5}"
+# Seam for tests: empty SUDO_CMD runs the command as the current user.
+: "${SUDO_CMD=sudo}"
 
 if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
     C_RESET=$'\033[0m'
@@ -157,6 +159,16 @@ _b64d() {
     printf '%s' "$1" | base64 -d
 }
 
+# Decode into _DECODED without losing trailing newlines. "$(base64 -d)" would
+# strip them, and every file written from a plan would lose its final "\n" -
+# content comparisons then never match and the doctor keeps reporting "differs".
+_DECODED=""
+_decode_param() {
+    local out
+    out=$(_b64d "$1"; printf '\001')
+    _DECODED=${out%$'\001'}
+}
+
 load_plan() {
     local step=$1
     shift
@@ -180,16 +192,17 @@ load_plan() {
     while IFS=$'\t' read -r tag f1 f2 f3 f4 f5 f6 f7; do
         case "$tag" in
             PLAN)  PLAN_STATUS=$f1; PLAN_EXIT=$f2 ;;
-            NOTE)  PLAN_NOTES+=("$(_b64d "$f1")") ;;
+            NOTE)  _decode_param "$f1"; PLAN_NOTES+=("$_DECODED") ;;
             ACT)
                 PLAN_KIND+=("$f2")
                 PLAN_SUDO+=("$f3")
                 PLAN_EFFECT+=("$f4")
                 PLAN_ID+=("$f5")
-                PLAN_SUMMARY+=("$(_b64d "$f6")")
+                _decode_param "$f6"
+                PLAN_SUMMARY+=("$_DECODED")
                 PLAN_SAT+=("$f7")
                 ;;
-            PARAM) PLAN_PARAM["$f1:$f2"]="$(_b64d "$f3")" ;;
+            PARAM) _decode_param "$f3"; PLAN_PARAM["$f1:$f2"]="$_DECODED" ;;
             END)   break ;;
         esac
     done <<<"$stream"
@@ -250,11 +263,17 @@ _apply_write_file() {
     mode=${mode:-644}
     if [[ "$sudo" == "1" ]]; then
         if [[ "$DRY_RUN" == "1" ]]; then
-            printf '[dry-run] sudo install -m %s -D /dev/stdin %q\n' "$mode" "$path"
+            printf '[dry-run] %s install -m %s -D /dev/stdin %q\n' "$SUDO_CMD" "$mode" "$path"
             return 0
         fi
-        printf '%s' "$content" | sudo tee "$path" >/dev/null
-        sudo chmod "$mode" "$path"
+        # install -D creates the parent directory. "tee" cannot, and a root
+        # write into a missing drop-in directory (/etc/systemd/journald.conf.d
+        # does not exist on Ubuntu) must never be attempted silently.
+        local sudo_cmd=()
+        if [[ -n "$SUDO_CMD" ]]; then
+            sudo_cmd=("$SUDO_CMD")
+        fi
+        printf '%s' "$content" | "${sudo_cmd[@]}" install -D -m "$mode" /dev/stdin "$path"
     else
         if [[ "$DRY_RUN" == "1" ]]; then
             printf '[dry-run] write %s (mode %s)\n' "$path" "$mode"
@@ -488,7 +507,9 @@ apply_plan() {
             continue
         fi
         log "${PLAN_SUMMARY[$index]}"
-        apply_action "$index"
+        if ! apply_action "$index"; then
+            die "action '${PLAN_ID[$index]}' failed: ${PLAN_SUMMARY[$index]}"
+        fi
     done
 
     if [[ "$DRY_RUN" != "1" && $skipped -eq ${#PLAN_KIND[@]} && ${#PLAN_KIND[@]} -gt 0 ]]; then

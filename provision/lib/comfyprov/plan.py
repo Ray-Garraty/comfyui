@@ -785,7 +785,11 @@ def _swap_actions(planner: Planner, plan: Plan) -> None:
         sudo=True,
         satisfied=exists and planner.probe.file_mode(path) == "600",
     )
-    formatted = size_ok and (planner.probe.run(["blkid", "-o", "value", "-s", "TYPE", path]).out.strip() == "swap")
+    # An active swapfile is already formatted: blkid refuses to probe it, and
+    # "mkswap /swapfile" then fails with "is mounted; will not make swapspace".
+    formatted = active or (
+        size_ok and planner.probe.run(["blkid", "-o", "value", "-s", "TYPE", path]).out.strip() == "swap"
+    )
     planner.exec(plan, "swap-mkswap", f"mkswap {path}", ["mkswap", path], sudo=True, satisfied=formatted)
     planner.exec(
         plan,
@@ -816,6 +820,16 @@ def _crash_logging_actions(planner: Planner, plan: Plan) -> None:
     which is exactly what provisioning is for.
     """
     facts = planner.facts
+    # Ubuntu ships no /etc/systemd/journald.conf.d, and writing a file must not
+    # silently fail because the directory is missing.
+    planner.exec(
+        plan,
+        "journald-dir",
+        f"Create {layout.JOURNALD_DROPIN.parent}",
+        ["install", "-d", "-m", "755", str(layout.JOURNALD_DROPIN.parent)],
+        sudo=True,
+        satisfied=facts.dir_exists(layout.JOURNALD_DROPIN.parent),
+    )
     planner.write(
         plan,
         layout.JOURNALD_DROPIN,
@@ -872,6 +886,44 @@ def _crash_logging_actions(planner: Planner, plan: Plan) -> None:
         ["sysctl", "--system"],
         sudo=True,
         satisfied=not wrong and facts.file("crash_sysctl") == layout.CRASH_SYSCTL_CONTENT,
+    )
+    # A freeze must reset the box on its own. The AMD chipset TCO timer is
+    # exposed by sp5100_tco; systemd keeps it fed and reboots if PID 1 stops.
+    module, reason = layout.watchdog_module(facts.isa_bridge, facts.acpi_wdat)
+    content = layout.modules_load_content(module)
+    planner.write(
+        plan,
+        layout.MODULES_LOAD_FILE,
+        content,
+        mode="644",
+        sudo=True,
+        current=facts.file("modules_load"),
+    )
+    planner.exec(
+        plan,
+        "watchdog-load",
+        f"Load the hardware watchdog ({module}: {reason})",
+        ["modprobe", module],
+        sudo=True,
+        allow_fail=True,
+        satisfied=facts.watchdog_present,
+    )
+    planner.write(
+        plan,
+        layout.WATCHDOG_DROPIN,
+        layout.WATCHDOG_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("watchdog"),
+    )
+    planner.exec(
+        plan,
+        "watchdog-reexec",
+        "Reload systemd with the watchdog settings",
+        ["systemctl", "daemon-reexec"],
+        sudo=True,
+        allow_fail=True,
+        satisfied=facts.file("watchdog") == layout.WATCHDOG_CONTENT and facts.watchdog_present,
     )
     planner.exec(
         plan,
