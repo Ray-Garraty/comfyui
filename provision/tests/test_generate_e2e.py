@@ -87,6 +87,5 @@ def test_generate_e2e_defaults() -> None:
     image_files = [f for f in new_files if f.suffix in (".png", ".jpg", ".jpeg", ".webp")]
     assert len(image_files) >= 1, f"No new images found in {OUTPUT_DIR}"
 
-    # Clean up generated files
-    for f in image_files:
-        f.unlink(missing_ok=True)
+    # Keep generated files on disk so the user can inspect them
+    print(f"Generated test image(s): {sorted(f.name for f in image_files)}")
