@@ -347,7 +347,7 @@ class TestInteractive(unittest.TestCase):
         self.assertEqual(settings.use_tiled_vae, True)
         self.assertEqual(settings.tile_size, 512)
 
-    def test_interactive_empty_prompt_raises(self):
+    def test_interactive_empty_prompt_retries_until_nonempty(self):
         inputs = iter(
             [
                 "1",  # select model #1
@@ -360,15 +360,20 @@ class TestInteractive(unittest.TestCase):
                 "euler",
                 "simple",
                 "1",
-                "",  # empty prompt
+                "",  # empty prompt -> must retry
+                "  ",  # whitespace-only prompt -> must retry
+                "a cat",  # valid prompt
+                "",  # neg prompt
             ]
         )
-        with mock.patch("builtins.input", lambda _: next(inputs)), self.assertRaises(ValueError):
-            interactive(
+        with mock.patch("builtins.input", lambda _: next(inputs)):
+            settings = interactive(
                 available_models=["model.safetensors"],
                 available_clip_models=["clip.safetensors"],
                 available_vae_models=["vae.safetensors"],
             )
+        self.assertEqual(settings.prompt, "a cat")
+        self.assertEqual(settings.neg_prompt, "")
 
 
 if __name__ == "__main__":

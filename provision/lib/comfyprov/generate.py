@@ -11,11 +11,13 @@ Designed for unit testing with fake filesystem / HTTP responses.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -25,6 +27,138 @@ from dataclasses import dataclass
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
+
+# ---------------------------------------------------------------------------
+# Output: terminal + log file without interactive latency
+# ---------------------------------------------------------------------------
+
+# Same format as the shell helpers in generate.sh: date '+%Y-%m-%d %H:%M:%S'.
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+class LogTee(io.TextIOBase):
+    """Write through to a terminal stream and to a log file, timestamping lines.
+
+    Business requirement: no delay after the user presses Enter at interactive
+    prompts.  Two rules follow from it:
+
+    * the terminal copy is flushed on every ``write()``, so a prompt is on
+      screen *before* ``input()`` blocks on stdin;
+    * the log copy is produced here, in-process, instead of by a shell
+      ``> >(while read line; do ...)`` loop: a consumer that falls behind (or
+      forks ``date`` per line) used to block Python's ``write()`` right after
+      Enter.
+
+    The wrapped stream stays owned by the interpreter: :meth:`close` only
+    detaches, it never closes the terminal.
+    """
+
+    def __init__(self, stream: Any, log: Any, time_format: str = LOG_TIME_FORMAT) -> None:
+        self._stream = stream
+        self._log = log
+        self._time_format = time_format
+        self._at_line_start = True
+        self._lock = threading.Lock()
+
+    # -- text stream protocol -------------------------------------------
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        with self._lock:
+            self._stream.write(text)
+            # Immediate flush: the prompt must be visible before input().
+            self._stream.flush()
+            self._write_log(text)
+        return len(text)
+
+    def flush(self) -> None:
+        with self._lock:
+            self._stream.flush()
+            if self._log is not None:
+                self._log.flush()
+
+    def close(self) -> None:
+        """Flush and detach from the log; the terminal stream is not ours."""
+        with self._lock:
+            if self._log is not None:
+                try:
+                    self._stream.flush()
+                    self._log.flush()
+                    self._log.close()
+                except (OSError, ValueError):
+                    pass
+                self._log = None
+
+    def writable(self) -> bool:
+        return True
+
+    def readable(self) -> bool:
+        return False
+
+    def seekable(self) -> bool:
+        return False
+
+    def fileno(self) -> int:
+        """input() calls sys.stdout.fileno() to decide whether to use readline."""
+        return int(self._stream.fileno())
+
+    def isatty(self) -> bool:
+        return bool(self._stream.isatty())
+
+    @property
+    def encoding(self) -> str:  # type: ignore[override]
+        return str(getattr(self._stream, "encoding", "utf-8") or "utf-8")
+
+    @property
+    def errors(self) -> str | None:  # type: ignore[override]
+        return getattr(self._stream, "errors", None)  # type: ignore[no-any-return]
+
+    # -- logging ---------------------------------------------------------
+    def _write_log(self, text: str) -> None:
+        """Append ``text`` to the log, prefixing each new line with a timestamp.
+
+        Only ``\\n`` terminates a logged line: the generation progress redraws
+        with ``\\r`` and must stay one readable line.
+        """
+        if self._log is None:
+            return
+        try:
+            for index, chunk in enumerate(text.split("\n")):
+                if index:
+                    self._log.write("\n")
+                    self._at_line_start = True
+                if not chunk:
+                    continue
+                if self._at_line_start:
+                    self._log.write(time.strftime(self._time_format) + " ")
+                    self._at_line_start = False
+                self._log.write(chunk)
+            self._log.flush()
+        except (OSError, ValueError):
+            # A full disk or a closed log must never break the prompts.
+            self._log = None
+
+
+def install_log_tee(log_path: str | os.PathLike[str] | None) -> LogTee | None:
+    """Mirror stdout/stderr into ``log_path``; return None when there is no path.
+
+    Generation output is logged from inside Python so that no shell pipe sits
+    between the interpreter and the terminal.  If the log cannot be opened the
+    terminal keeps working as before.
+    """
+    if not log_path:
+        return None
+    try:
+        # The handle is owned by the returned tee for the whole process lifetime.
+        handle = open(os.fspath(log_path), "a", encoding="utf-8", errors="replace")  # noqa: SIM115
+    except OSError as exc:
+        print(f"WARN: cannot write log file {log_path}: {exc}", file=sys.stderr)
+        return None
+    tee = LogTee(sys.stdout, handle)
+    sys.stdout = tee  # type: ignore[assignment]
+    sys.stderr = tee  # type: ignore[assignment]
+    return tee
+
 
 # ---------------------------------------------------------------------------
 # Data
@@ -363,6 +497,7 @@ def run_generation(
 
 def _ask(prompt: str, default: str | None = None) -> str:
     prompt = f"{prompt} [default {default}]: " if default is not None else f"{prompt}: "
+    sys.stdout.flush()
     value = input(prompt)
     return value if value.strip() else (default or "")
 
@@ -399,6 +534,7 @@ def _select_from_list(title: str, options: list[str], default_index: int = 1) ->
         marker = " (default)" if i == default_index else ""
         print(f"  {i}) {name}{marker}")
     print()
+    sys.stdout.flush()
     while True:
         sel = input(f"Select [1-{len(options)}]: ").strip()
         if not sel:
@@ -515,9 +651,11 @@ def interactive(
         import random
 
         seed = random.randint(0, 18446744073709551615)
-    prompt = _ask("Prompt")
-    if not prompt.strip():
-        raise ValueError("Prompt cannot be empty")
+    while True:
+        prompt = _ask("Prompt")
+        if prompt.strip():
+            break
+        print("Prompt cannot be empty")
     neg_prompt = _ask("Negative prompt")
 
     return GenerationSettings(
@@ -554,6 +692,13 @@ def main(argv: list[str] | None = None) -> int:
     clip_dir = argv[3] if len(argv) > 3 else ""
     vae_dir = argv[4] if len(argv) > 4 else ""
     model_names = argv[5:] if len(argv) > 5 else []
+
+    # Duplicate stdout/stderr to the log file (path passed via env by
+    # generate.sh) while keeping the terminal as the real stdout, so that
+    # interactive prompts appear instantly with no pipe buffering.
+    log_file = os.environ.get("GENERATE_LOG_FILE")
+    if log_file:
+        install_log_tee(log_file)
 
     available_models = discover_models(diff_dir) if diff_dir else None
     available_clip_models = discover_models(clip_dir) if clip_dir else None
