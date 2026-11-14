@@ -223,7 +223,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_findings_cover_the_whole_chain(self) -> None:
         probe = crash_probe(self.config)
-        findings = crashlog.findings(self.config, probe, crashlog.collect(probe))
+        facts = collect(self.config, probe)
+        findings = crashlog.findings(self.config, probe, facts, crashlog.collect(probe))
         names = {item.name for item in findings}
         self.assertIn("journald", names)
         self.assertIn("watchdog", names)
@@ -233,7 +234,8 @@ class EvidenceTests(unittest.TestCase):
 
     def test_missing_configuration_warns(self) -> None:
         probe = clean_host(self.config)
-        findings = crashlog.findings(self.config, probe)
+        facts = collect(self.config, probe)
+        findings = crashlog.findings(self.config, probe, facts)
         levels = {item.name: item.level for item in findings}
         self.assertEqual(levels["journald"], "warn")
         self.assertEqual(levels["watchdog"], "warn")

@@ -183,6 +183,122 @@ PSTORE_UNIT = "systemd-pstore.service"
 PSTORE_ENABLED_STATES = ("enabled", "enabled-runtime", "static", "indirect")
 KERNEL_LOG_COPY = Path("/var/log/comfyui-kernel.log")
 
+# Force-load the watchdog despite the distro denylist. modules-load.d refuses
+# deny-listed modules, but plain modprobe ignores the blacklist. A oneshot
+# systemd unit runs it early enough to catch a freeze before userspace dies.
+FORCE_WATCHDOG_DIR = Path("/etc/systemd/system/comfyui-force-watchdog.service.d")
+FORCE_WATCHDOG_SERVICE = Path("/etc/systemd/system/comfyui-force-watchdog.service")
+FORCE_WATCHDOG_SERVICE_CONTENT = """# ComfyUI / force-load the chipset watchdog despite modprobe.d denylists
+# The kernel module denylist blocks modules-load.d, but modprobe itself ignores
+# it. This oneshot unit runs modprobe directly before any GPU workload starts.
+[Unit]
+Description=Force-load hardware watchdog for freeze detection
+DefaultDependencies=no
+Before=sysinit.target
+ConditionPathExists=/dev/watchdog0|!Exists=/sys/class/watchdog
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/modprobe {module}
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+"""
+FORCE_WATCHDOG_OVERRIDE_CONTENT = """# ComfyUI / do not let the denylist win
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/modprobe {module}
+"""
+
+# Netconsole: send kernel printk over UDP to a second machine. This is the
+# only way to read the last lines of a true platform freeze — journald and
+# pstore both die with the kernel.
+NETCONSOLE_CONF = Path("/etc/modprobe.d/comfyui-netconsole.conf")
+NETCONSOLE_CMDLINE_FILE = Path("/etc/kernel/cmdline.d/comfyui-netconsole.cfg")
+NETCONSOLE_MODULE_CONF = Path("/etc/modules-load.d/comfyui-netconsole.conf")
+NETCONSOLE_MODULE_CONTENT = """# ComfyUI / netconsole for out-of-band crash capture
+netconsole
+"""
+
+# Ramoops: persistent RAM backend for pstore. Reserves a small region of RAM
+# that survives a reset so the last dmesg lines can be read after reboot.
+RAMOOPS_CONF = Path("/etc/modprobe.d/comfyui-ramoops.conf")
+RAMOOPS_MODULE_CONF = Path("/etc/modules-load.d/comfyui-ramoops.conf")
+RAMOOPS_MODULE_CONTENT = """# ComfyUI / ramoops persistent memory for pstore
+ramoops
+"""
+RAMOOPS_PARAMS_CONTENT = """# ComfyUI / ramoops parameters
+options ramoops mem_map_size=0x100000 mem_count=4
+"""
+RAMOOPS_SYSCTL_ADDITIONS: dict[str, str] = {}
+
+# Crash doctor: a single command that gathers all evidence for a crash
+# and prints a verdict in well under 60 seconds.
+CRASH_DOCTOR_DIR = Path("/usr/local/bin")
+CRASH_DOCTOR = CRASH_DOCTOR_DIR / "crash-doctor"
+CRASH_DOCTOR_CONTENT = """#!/usr/bin/env bash
+set -Eeuo pipefail
+# crash-doctor - automated root-cause determination for a ComfyUI crash.
+# Runs everything read-only; needs no sudo, no venv, no network.
+# Output is designed to answer "what killed the OS" in well under 60 seconds.
+ROOT="${1:-$(pwd)}"
+cd "$ROOT" || exit 1
+
+echo "== crash-doctor == $(date -Is)"
+echo
+
+echo "--- boot inventory ---"
+./tools/crashlab/crashlab boots
+
+echo
+echo "--- verdict for last unclean boot ---"
+./tools/crashlab/crashlab report --boot -1 --brief
+
+echo
+echo --- decided-by checklist ---
+./tools/crashlab/crashlab report --boot -1 --full 2>/dev/null | sed -n '/^decided by:/,/^$/p'
+
+echo
+echo --- evidence ---
+./tools/crashlab/crashlab report --boot -1 --full 2>/dev/null | sed -n '/^evidence:/,/^what ran/p'
+
+echo
+echo --- log stop order ---
+./tools/crashlab/crashlab report --boot -1 --full 2>/dev/null | sed -n '/^log stop order:/,/^drift:/p'
+
+echo
+echo --- drift ---
+./tools/crashlab/crashlab report --boot -1 --full 2>/dev/null | sed -n '/^drift:/,/^boot history/p'
+
+echo
+echo --- next steps ---
+./tools/crashlab/crashlab report --boot -1 --full 2>/dev/null | sed -n '/^next steps:/,$p'
+"""
+
+# ComfyUI launcher and generate.sh logging sync loop
+# (kept in start-comfyui.sh and generate.sh; documented here for completeness)
+LOG_SYNC_SCRIPT = Path("/usr/local/bin/comfyui-log-sync")
+LOG_SYNC_CONTENT = """#!/usr/bin/env bash
+# comfyui-log-sync - fsync log files every LOG_SYNC_INTERVAL seconds.
+# Exits when its parent process dies.
+set -Eeuo pipefail
+LOGS="${1:-/home/vlabe/Documents/comfyui/logs}"
+INTERVAL="${2:-5}"
+PPID=$$
+while kill -0 "$PPID" 2>/dev/null; do
+    sync -f "$LOGS"/*.log 2>/dev/null || true
+    sleep "$INTERVAL"
+done
+"""
+
+UDEV_FILE = Path("/etc/udev/rules.d/99-comfyui-amd.rules")
+UDEV_RULE_MARKER = "ComfyUI / ROCm"
+UDEV_CONTENT = """# ComfyUI / ROCm access to AMD compute and render nodes
+KERNEL=="kfd", GROUP="render", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="renderD*", GROUP="render", MODE="0660"
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", GROUP="video", MODE="0660"
+"""
 UDEV_FILE = Path("/etc/udev/rules.d/99-comfyui-amd.rules")
 UDEV_RULE_MARKER = "ComfyUI / ROCm"
 UDEV_CONTENT = """# ComfyUI / ROCm access to AMD compute and render nodes

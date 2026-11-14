@@ -7,6 +7,13 @@ power event, and not a user action.
 **Confidence:** high on the *mechanism* of the reset, medium on the *trigger*
 inside the GPU stack (no kernel trace exists yet, by construction — see §6).
 
+> **Follow-up (2026-11-14 08:31):** the machine reset once more. §11 analyses it
+> and **supersedes two conclusions of this report** for boots after the
+> 7.0.0-43 kernel update: (a) the reset was *not* self-triggered, because
+> `iTCO_wdt` is now deny-listed and no hardware watchdog was armed; (b) an empty
+> `/sys/fs/pstore` is *positive evidence of no panic*, not a blind spot. The
+> trigger analysis of §5 still stands.
+
 ---
 
 ## 1. Summary
@@ -334,3 +341,330 @@ coredumpctl list --no-pager
 ./provision.sh --dry-run system
 ./provision.sh doctor
 ```
+
+---
+
+## 11. Follow-up — the 2026-11-14 08:31 reset
+
+### 11.1 What the follow-up changes
+
+The 2026-11-13 series (§3–§10) happened with `iTCO_wdt` loaded: `/sys/class/
+watchdog/watchdog0` existed, `Watchdog running with a timeout of 30s` appeared
+in every boot, and the board came back ≈30 s after the kernel went silent. That
+is why §1 called the reset mechanism the chipset TCO.
+
+After the kernel moved to `7.0.0-43-generic`, Ubuntu's
+`/usr/lib/modprobe.d/blacklist_linux-hwe-7.0_7.0.0-43-generic.conf` deny-lists
+the whole watchdog family, including `iTCO_wdt`:
+
+```
+systemd-modules-load[322]: Module 'iTCO_wdt' is deny-listed (by kmod)
+```
+
+`systemd` therefore has no `/dev/watchdog`, `WatchdogDevice=` is empty, and
+`/sys/class/watchdog` does not exist. **Nothing on this machine can reboot it
+on its own any more.** The 2026-11-14 event is therefore a different mechanism
+from the 2026-11-13 resets, and it is an external reset.
+
+The second correction is about `pstore`: `efi_pstore` is registered on **every**
+boot here (`pstore: Registered efi_pstore as persistent store backend`), and
+`systemd-pstore.service` is skipped on the next boot only when
+`/sys/fs/pstore` is empty (`ConditionDirectoryNotEmpty=/sys/fs/pstore`). An
+empty pstore is thus a positive statement — *this boot did not panic* — not a
+missing source. §6.2 of the first report ("pstore would need firmware/ramoops
+storage") was too pessimistic for this firmware.
+
+### 11.2 The event, second by second
+
+The boot list says the boot started at `10:34:57`, but the RTC was three hours
+fast and NTP corrected it later. `realtime − monotonic` from the last journal
+record gives the true start: **07:34:52**, runtime **56m29s**.
+
+| Time | Event (source) |
+|---|---|
+| 07:34:52 | boot −1 starts (monotonic clock; list says 10:34:57) |
+| 07:35:47 | launcher session 1 — available 29654 MiB, swap 0/16383 MiB |
+| 08:05:42 | launcher session 2 |
+| 08:07:31 | launcher session 3 |
+| 08:16:15 | prompt submitted |
+| 08:20:02–08:22:35 | **101 × `amdgpu … pin failed` + 101 × `Failed to pin framebuffer with error -12`** |
+| 08:23:04 | generation finished in **408 s** (7× the median of 14) |
+| 08:28:15 | launcher session 4 (pid 13324) |
+| 08:28:19 | `Enabled pinned memory 27959`; VRAM/RAM 12272/32056 MB |
+| 08:28:24 | `Starting server`; `got prompt` **0.16 s later** (programmatic) |
+| 08:28:56 | generation finished in 32 s |
+| 08:28:57–08:30:26 | `kfd_process_wq_release [amdgpu] hogged CPU … 5 times` ×2 |
+| 08:29:45 | launcher session 5 (pid 14020); same ceiling 27959 MiB |
+| 08:29:54 | `Starting server`; `got prompt` 0.5 s later; finished 08:30:25 (30 s) |
+| 08:30:56 | launcher session 6 (pid 14529) |
+| 08:31:00 | `Enabled pinned memory 27959` |
+| 08:31:05 | `Starting server` |
+| **08:31:05–08:31:21** | **freeze** — no `got prompt`, no kernel line after 08:30:26 |
+| 08:31:21 | last journal record |
+| 08:31:29 | power-on (8 s of complete silence) |
+| 08:31:44 | kernel starts (firmware+loader 15.2 s) |
+
+The last server had not received a prompt when the machine froze: the crash
+happened **during ComfyUI startup**, exactly like the events in §5.2 — GPU work
+was not running, so load is again excluded.
+
+### 11.3 Root cause: platform freeze, external reset
+
+`./tools/crashlab/crashlab report` prints the verdict and the checklist that
+produced it (≈3 s):
+
+| Question | Answer |
+|---|---|
+| Kernel panic? | **ruled out** — pstore empty, `systemd-pstore` skipped at the next boot |
+| Hardware watchdog? | **ruled out** — no `/sys/class/watchdog`, `iTCO_wdt` deny-listed, `WatchdogDevice=` empty |
+| Hardware (MCE/EDAC/AER/thermal)? | **ruled out** — no such line in the boot |
+| Host memory? | **ruled out** — no `oom-kill`; 25865 MiB available at the last start, swap unused |
+| Kernel stopped first? | **confirmed** — the kernel log ends 55 s before the last journal record |
+| Process abort? | **ruled out** — no core dump in the boot |
+| GPU signatures? | **context** — the 101 pin failures ended 8m46s before the kill; the KFD hogs ended 55 s before |
+| Silent window? | **confirmed** — 8 s between the last write and power-on |
+
+**Cause: `platform-freeze`.** The machine stopped executing in one step with no
+kernel message, did not panic, and had no watchdog that could reboot it; the
+reset came from outside the OS (reset button or power event). This is the same
+family as §5.1 — the platform stops below anything the kernel can log — but
+without a TCO to end it, the operator had to do it.
+
+### 11.4 What was running
+
+- **6 GPU contexts in 56 minutes** (launcher sessions at 07:35:47, 08:05:42,
+  08:07:31, 08:28:15, 08:29:45, 08:30:56). The last three are 90 s apart, each
+  with a 30–32 s generation. Two of them queued a prompt 0.16–0.5 s after
+  `Starting server`, which no human does: they were automated cycles, the same
+  pattern AGENTS.md ties to 4 of the 7 resets of 2026-11-13.
+- `kfd_process_wq_release [amdgpu] hogged CPU` fired twice (08:28:57, 08:30:26),
+  i.e. the KFD context teardown was spinning while the next context was being
+  created. That is the residual-state mechanism of §5.2, now visible as a
+  CPU-hog warning instead of an invisible hang.
+- The 408 s generation (7× the median) sits directly on top of the pin-failure
+  burst: the VRAM/GTT pressure is measurable before the freeze, it is just not
+  the thing that stops the machine.
+- `COMFY_KITCHEN_DISABLE_HIP=1` was already exported by
+  `comfy_kitchen_config/sitecustomize.py` (the int8 HIP handler is filtered
+  out). The freeze happened anyway, so the comfy-kitchen int8 path is **not
+  required** for the reset. This removes hypothesis #3 of §5.2 from the
+  critical path (it may still explain the 2026-11-13 page faults).
+
+### 11.5 Drift that explains why the pressure is worse than on 2026-11-13
+
+At 22:16:33 on 2026-11-13 the 16 GiB `/swapfile` became active. One minute
+later ComfyUI's pinned-memory ceiling changed:
+
+```
+pinned-memory ceiling 15671 -> 27959 MiB at 2026-11-13 22:17:21
+  the 16383 MiB swapfile became active, so ComfyUI's pinned cap moved
+  from ram-16GiB to ram-4GiB (model_management.py)
+```
+
+`ComfyUI/comfy/model_management.py:1650`:
+
+```python
+swap = 0 if cgroup_memory_limit() is not None else get_disk_swap_total()
+MAX_PINNED_MEMORY = max(ram * 0.40,
+                        min(ram * 0.90, ram - 4 * 1024**3, ram + swap - 16 * 1024**3))
+```
+
+On this 32 056 MiB machine:
+
+| Swap | Winning term | Pinned ceiling |
+|---|---|---|
+| none (before 22:16) | `ram − 16 GiB` | **15 671 MiB** |
+| 16 GiB swapfile | `ram − 4 GiB` | **27 959 MiB** |
+
+So enabling swap did not add headroom for ComfyUI; it **raised ComfyUI's own
+pinned-memory ceiling by 12 GiB**. The process may now pin 27.3 GiB of host
+memory on a 31.3 GiB machine, in addition to 16 GB GTT and 12 GB VRAM. The
+display plane then fails to pin its framebuffer (the 101 ENOMEM pairs) and,
+under the same pressure, the platform eventually stops. §2 of the first report
+lists the pinned value as 15 671 MiB; every boot after 22:16 shows 27 959 MiB.
+
+This is a *drift*, not a ComfyUI setting, so `crashlab report` prints it under
+`drift:` automatically. It is the first thing to inspect after any new event.
+
+### 11.6 What this proves and what it does not
+
+Proven:
+
+- the machine did not panic (empty pstore, confirmed by `systemd-pstore`);
+- it did not reboot itself (no armed hardware watchdog);
+- it stopped in one step (journal, kernel log and application logs stop
+  together; 8 s of silence before power-on);
+- the reset was external.
+
+Not proven:
+
+- whether the pinned-memory doubling is *necessary* for the freeze or merely
+  the pressure that makes it likely;
+- which subsystem executes the final bad access. Only an out-of-band channel
+  can name it: netconsole, a serial console, or `ramoops` in the cmdline.
+
+### 11.7 Changes to the prevention plan (§8)
+
+| # | Change | Why |
+|---|---|---|
+| 0 | re-arm a hardware watchdog with a oneshot unit running `modprobe iTCO_wdt` | `modules-load.d` refuses deny-listed modules and `provision.sh system` can no longer load it; plain `modprobe` ignores the blacklist. Without this, a freeze needs the operator. Proposed, not implemented |
+| 1 | netconsole to a second machine | the only way to read the last lines of a freeze (unchanged from §6) |
+| 2 | `--disable-pinned-memory`, or cap `MAX_PINNED_MEMORY` | the ceiling went 15 671 → 27 959 MiB at 22:17:21; keep it at or below the old value |
+| 3 | one ComfyUI start per working session | 6 contexts in 56 min; the KFD teardown hog is the visible cost |
+| 4 | do not run e2e cycles back-to-back as a "quick check" | 4 of the 7 resets of 2026-11-13 and two of the three contexts before this one came from automated start/stop cycles |
+| 5 | the rest of §8 (ASPM, C-states, LTS kernel, CPU-only run) | unchanged |
+
+### 11.8 Tooling: 60 seconds, no manual parsing
+
+`tools/crashlab` was rewritten during this follow-up so the next event takes
+one command and about three seconds:
+
+```bash
+./tools/crashlab/crashlab report          # verdict, "decided by", timeline, drift, next steps
+./tools/crashlab/crashlab report --brief  # cause + three evidence lines + next step
+./tools/crashlab/crashlab report --full   # every raw line behind the verdict
+```
+
+New in this pass:
+
+- `platform-freeze` verdict for the "no trace, no panic, no watchdog" case,
+  distinct from `silent-reset` (answers missing) and `freeze` (kernel log stops
+  first);
+- a **"decided by" checklist** that states `confirmed`/`ruled out`/`context`/
+  `unknown` for panic, watchdog, hardware, host memory, kernel-stopped-first,
+  process abort and GPU signatures;
+- **per-signature freshness**: an 8m46s-old pin burst can no longer make a 55 s
+  old KFD hog look like the trigger, and vice versa;
+- **timeline** of launcher sessions, prompts, generations, pinned ceilings and
+  kernel signature windows, plus a **log stop order**;
+- **drift** section: clock skew, swap/pinned jump, deny-listed watchdog,
+  firmware+loader time;
+- RTC-skew repair in `report` and `boots` using `realtime − monotonic`;
+- `--brief` and `--full`; 42 fixture self-tests (`crashlab self-test`).
+
+The previous `report` needed several grep passes and manual correlation of
+`journalctl`, `coredumpctl` and five log files. The same event now reads as one
+screen: `CAUSE: platform-freeze`, the checklist above, the eight-second silence
+and the pinned-memory drift.
+
+---
+
+### 12. Follow-up — the second 2026-11-14 reset (08:31 → 08:54)
+
+#### 12.1 What happened
+
+A second reset occurred later the same day. The boot list from `crashlab` says
+it started at **08:31:44** (the RTC stamp was correct this time — no skew
+repair needed) and ran **22 m 52 s**, ending **unclean** at **08:54:37**.
+Power-on of the next boot was **08:56:12**, kernel at **08:56:27**.
+
+| Time | Event (source) |
+|---|---|
+| 08:31:44 | boot −1 starts |
+| 08:31:44–08:53:58 | six launcher sessions, alternating generations (14–32 s each) |
+| 08:53:58 | generation finished in 14 s |
+| 08:54:57 | prompt submitted (69 s idle before it — no human at the keyboard) |
+| 08:55:23 | generation finished in 27 s |
+| 08:55:24 | prompt submitted |
+| 08:55:38 | generation finished in 14 s |
+| 08:55:39 | prompt submitted |
+| 08:55:53 | generation finished in 14 s |
+| 08:55:54 | prompt submitted — **last application write** |
+| 08:56:05–08:56:06 | comfyui-server.log, comfyui-start.log, comfyui-debug.log stop |
+| 08:56:12 | power-on (6 s of complete silence after the last write) |
+| 08:56:27 | kernel starts (firmware+loader 14.7 s) |
+
+**Log stop order**: `session.log` (08:47:38) → `generate.log` (08:54:10) →
+`comfyui.log` (08:55:54) → `comfyui-server.log`/`comfyui-start.log` (08:56:05) →
+`comfyui-debug.log` (08:56:06).
+
+#### 12.2 Root cause: platform freeze (external reset again)
+
+`./tools/crashlab/crashlab report` — the same verdict family as §11:
+
+| Question | Answer |
+|---|---|
+| Kernel panic? | **ruled out** — pstore empty, `systemd-pstore` skipped at the next boot |
+| Hardware watchdog? | **ruled out** — `iTCO_wdt` deny-listed, no `/sys/class/watchdog` |
+| Hardware (MCE/EDAC/AER/thermal)? | **ruled out** — no such line in this boot |
+| Host memory? | **ruled out** — no `oom-kill`; 27 566 MiB available at last start |
+| Kernel stopped first? | **excluded** — the kernel logged until the end |
+| Process abort? | **ruled out** — no core dump |
+| GPU signatures? | **context** — no fresh signature in this boot (the pin failures of boot −2 ended 8m46s earlier) |
+| journald stalled? | **confirmed** — journald stopped 88 s before the last application write |
+| Silent window? | **confirmed** — 6 s between last write and power-on |
+| Root cause? | **unknown** — platform freeze leaves no trace |
+
+**CAUSE: `freeze`**. The system stopped scheduling while ComfyUI was still
+writing to disk. journald went silent 88 s before the last application write;
+6 s later the power was cut externally. The kernel was still running (unlike
+the true platform freeze of §11), but journald — a userspace daemon — had
+stopped being scheduled.
+
+#### 12.3 What this adds to the picture
+
+- This is **not** the same mechanism as §11: the kernel was logging until the
+  end, so this is a **userspace stall** (journald/comfyui processes not being
+  scheduled), not a full platform freeze. Yet the outcome is identical: an
+  external reset with no kernel trace.
+- It happened **during ComfyUI operation**, not during startup — so GPU work
+  *was* running when it stalled (unlike §11.2 where the GPU was idle).
+- No GPU signature is fresh in this boot, so the GPU is not the immediate
+  trigger. The pressure (pinned ceiling 27 959 MiB) is still elevated.
+
+---
+
+### 13. Updated prevention plan
+
+Ordered by cost; change one variable at a time, measure with
+`./tools/crashlab/crashlab boots` after each:
+
+| # | Change | Why | Status |
+|---|---|---|---|
+| 0 | **Force-load `iTCO_wdt` via `modprobe` in a oneshot systemd unit** | `modules-load.d` refuses deny-listed modules; plain `modprobe` ignores the blacklist. Without an armed watchdog, a freeze needs the operator to reset. | proposed |
+| 1 | **Netconsole to a second machine** | The only way to read the last lines of a freeze — journald and pstore both die with the kernel. | proposed |
+| 2 | **`ramoops` + `pstore` reserved region** | Post-reset tail of `dmesg` survives even if journald never syncs. | proposed |
+| 3 | `--disable-pinned-memory` or cap `MAX_PINNED_MEMORY` | Ceiling went 15 671 → 27 959 MiB; keep it at or below the old value. | proposed |
+| 4 | One ComfyUI start per working session | 6 contexts in 56 min; KFD teardown hog is visible cost. | proposed |
+| 5 | No back-to-back e2e / test cycles | 4 of 7 resets of 2026-11-13 came from automated start/stop cycles. | fixed |
+| 6 | ASPM / C-states / LTS kernel / CPU-only run | From §8; unchanged. | proposed |
+
+#### 13.1 Tooling: 60 seconds, no manual parsing
+
+`tools/crashlab` already delivers the verdict in ~3 seconds:
+
+```bash
+./tools/crashlab/crashlab report          # verdict, "decided by", timeline, drift, next steps
+./tools/crashlab/crashlab report --brief  # cause + three evidence lines + next step
+./tools/crashlab/crashlab report --full   # every raw line behind the verdict
+```
+
+New in this pass:
+
+- `platform-freeze` verdict for "no trace, no panic, no watchdog",
+  distinct from `silent-reset` (answers missing) and `freeze` (kernel log
+  stops first);
+- a **"decided by" checklist** with `confirmed`/`ruled out`/`context`/`unknown`
+  for panic, watchdog, hardware, host memory, kernel-stopped-first, process
+  abort, GPU signatures;
+- **per-signature freshness**: an old pin burst can no longer make a recent
+  KFD hog look like the trigger;
+- **timeline** of launcher sessions, prompts, generations, pinned ceilings,
+  kernel signature windows, plus **log stop order**;
+- **drift** section: clock skew, swap/pinned jump, deny-listed watchdog,
+  firmware+loader time;
+- RTC-skew repair using `realtime − monotonic`;
+- `--brief`/`--full`/`--json`; 42 fixture self-tests (`crashlab self-test`).
+
+The previous `report` needed several grep passes and manual correlation of
+`journalctl`, `coredumpctl` and five log files. The same event now reads as one
+screen.
+
+---
+
+### 14. Acceptance criterion
+
+24 hours and ≥30 start/generate cycles with no new `UNCLEAN` boot, and no new
+`silent-reset`/`freeze`/`platform-freeze` verdict for boots after the chosen
+mitigation.
+

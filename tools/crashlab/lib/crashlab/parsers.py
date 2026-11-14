@@ -14,9 +14,10 @@ Input formats handled:
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # -- signatures --------------------------------------------------------------
 # name, pattern, weight. Weight orders the report only; it is not a probability.
@@ -33,6 +34,7 @@ SIGNATURES: tuple[tuple[str, re.Pattern[str], int], ...] = (
         9,
     ),
     ("watchdog lockup", re.compile(r"soft lockup|hard LOCKUP|watchdog: BUG|hung_task"), 8),
+    ("KFD teardown hog", re.compile(r"kfd_process_wq_release .* hogged CPU"), 3),
     ("out of memory", re.compile(r"Out of memory|oom-kill|invoked oom-killer"), 7),
     (
         "kernel panic",
@@ -115,6 +117,43 @@ def signature_samples(lines: list[str], limit: int = 3) -> dict[str, list[str]]:
     return samples
 
 
+@dataclass(frozen=True)
+class SignatureWindow:
+    """When a signature fired: a burst is different from a single old line."""
+
+    first: datetime | None
+    last: datetime | None
+    hits: int
+
+    def to_dict(self) -> dict:
+        return {
+            "first": self.first.isoformat() if self.first else None,
+            "last": self.last.isoformat() if self.last else None,
+            "hits": self.hits,
+        }
+
+
+def signature_windows(lines: list[str]) -> dict[str, SignatureWindow]:
+    """Count every signature and remember its first and last timestamp.
+
+    The report needs "101 pin failures between 08:21:11 and 08:22:35", not
+    "101 pin failures" and 101 lines to scroll through.
+    """
+    windows: dict[str, SignatureWindow] = {}
+    for name, pattern, _weight in SIGNATURES:
+        stamps: list[datetime] = []
+        for line in lines:
+            if not pattern.search(line):
+                continue
+            stamp = parse_stamp(line.split(" ", 1)[0])
+            if stamp:
+                stamps.append(stamp)
+        if not stamps:
+            continue
+        windows[name] = SignatureWindow(min(stamps), max(stamps), len(stamps))
+    return windows
+
+
 # -- boots -------------------------------------------------------------------
 @dataclass(frozen=True)
 class Boot:
@@ -145,6 +184,216 @@ def parse_list_boots(text: str) -> list[Boot]:
 
 def is_clean_shutdown(lines: list[str]) -> bool:
     return any(SHUTDOWN_MARKERS.search(line) for line in lines)
+
+
+# -- boot clock --------------------------------------------------------------
+@dataclass(frozen=True)
+class JournalAnchor:
+    """One journal record: wall clock plus how long the kernel had been up.
+
+    ``boot_start = realtime - monotonic`` does not care that the RTC was wrong
+    at boot (it happens on this machine) or that NTP stepped the clock later,
+    which is exactly what makes the boot-list timestamps unusable.
+    """
+
+    realtime: datetime
+    monotonic_s: float
+
+    @property
+    def boot_start(self) -> datetime:
+        return self.realtime - timedelta(seconds=self.monotonic_s)
+
+
+def parse_journal_anchor(text: str) -> JournalAnchor | None:
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(payload, list):
+        payload = payload[-1] if payload else None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        realtime = datetime.fromtimestamp(int(str(payload["__REALTIME_TIMESTAMP"])) / 1_000_000)
+        monotonic = int(str(payload["__MONOTONIC_TIMESTAMP"])) / 1_000_000
+    except (KeyError, TypeError, ValueError):
+        return None
+    return JournalAnchor(realtime, monotonic)
+
+
+ANALYZE_ROW = re.compile(r"(?P<value>[\d.]+)s \((?P<kind>firmware|loader|kernel|userspace)\)")
+
+
+def parse_systemd_analyze(text: str) -> dict[str, float]:
+    """``Startup finished in 10.037s (firmware) + 5.187s (loader) + ...``"""
+    values: dict[str, float] = {}
+    for match in ANALYZE_ROW.finditer(text):
+        values[match.group("kind")] = float(match.group("value"))
+    return values
+
+
+def journal_gaps(lines: list[str]) -> list[float]:
+    """Seconds between consecutive journal records of one boot.
+
+    Needed to tell a *stalled* journal from an *idle* one: this machine logs
+    nothing for minutes while ComfyUI works, so a long silence at the end only
+    means something if the boot never had such silences before.
+    """
+    stamps: list[datetime] = []
+    for line in lines:
+        stamp = parse_stamp(line.split(" ", 1)[0])
+        if stamp:
+            stamps.append(stamp)
+    return [
+        (later - earlier).total_seconds()
+        for earlier, later in zip(stamps, stamps[1:], strict=False)
+        if later >= earlier
+    ]
+
+
+DENYLISTED = re.compile(r"Module '(?P<module>[^']+)' is deny-listed")
+BLACKLIST_ROW = re.compile(r"^\s*blacklist\s+(?P<module>\S+)\s*$")
+WATCHDOG_ARMED = re.compile(r"Using hardware watchdog '(?P<identity>[^']+)'")
+WATCHDOG_TIMEOUT = re.compile(r"Watchdog running with a timeout of (?P<seconds>\d+)s")
+PSTORE_SKIPPED = re.compile(
+    r"systemd-pstore\.service.*skipped because of an unmet condition check"
+    r" \(ConditionDirectoryNotEmpty=/sys/fs/pstore\)"
+)
+PSTORE_BACKEND = re.compile(r"Registered (?P<backend>\S+) as persistent store backend")
+
+
+def denylisted_modules(lines: list[str]) -> list[str]:
+    found: list[str] = []
+    for line in lines:
+        match = DENYLISTED.search(line)
+        if match and match.group("module") not in found:
+            found.append(match.group("module"))
+    return found
+
+
+def parse_blacklist(text: str, path: str) -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        match = BLACKLIST_ROW.match(line)
+        if match:
+            rows.append((match.group("module"), path))
+    return rows
+
+
+def watchdog_state(lines: list[str]) -> tuple[bool | None, str]:
+    """Was a *hardware* watchdog armed in that boot? The journal is the only
+    source that also covers boots from before the current module state."""
+    armed = None
+    identity = ""
+    timeout = ""
+    for line in lines:
+        match = WATCHDOG_ARMED.search(line)
+        if match:
+            armed = True
+            identity = match.group("identity")
+        match = WATCHDOG_TIMEOUT.search(line)
+        if match:
+            timeout = match.group("seconds")
+    if armed:
+        return True, f"{identity or 'watchdog'} timeout {timeout or '?'} s"
+    if any("Watchdog running" in line or "Using hardware watchdog" in line for line in lines):
+        return True, "armed"
+    return (False, "") if lines else (None, "")
+
+
+def pstore_state(lines: list[str]) -> str:
+    """What the pstore said at the boot after the crash.
+
+    ``empty`` is a *positive* finding: efi_pstore is registered by the kernel
+    every boot, so a panic in the previous boot would have left a record that
+    systemd-pstore archives. "No record" therefore rules the panic path out.
+    """
+    if any(PSTORE_SKIPPED.search(line) for line in lines):
+        return "empty"
+    if any(PSTORE_BACKEND.search(line) for line in lines):
+        return "unknown"
+    return "unknown"
+
+
+# -- application logs --------------------------------------------------------
+APP_TS = re.compile(r"(?P<ts>\d{4}-\d\d-\d\d[ T]\d\d:\d\d:\d\d(?:[,.](?P<frac>\d{1,6}))?)")
+
+COMFY_EVENTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("start", re.compile(r"\[INFO\] Starting server")),
+    ("prompt", re.compile(r"\[INFO\] got prompt")),
+    ("done", re.compile(r"\[INFO\] Prompt executed in (?P<seconds>[\d.]+) seconds")),
+    ("pinned", re.compile(r"\[INFO\] Enabled pinned memory (?P<mib>\d+)")),
+    ("vram", re.compile(r"\[INFO\] Total VRAM (?P<vram>\d+) MB, total RAM (?P<ram>\d+) MB")),
+)
+
+GENERATE_EVENTS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("generate-start", re.compile(r"=== generate\.sh started ===")),
+    ("generate-ready", re.compile(r"ComfyUI is ready at")),
+    (
+        "generate-step",
+        re.compile(r"(Available generative models on disk|Text encoders \(CLIP\)|VAE models|Samplers|Schedulers)"),
+    ),
+)
+
+
+@dataclass(frozen=True)
+class AppEvent:
+    at: datetime
+    source: str
+    kind: str
+    detail: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "at": self.at.isoformat(),
+            "source": self.source,
+            "kind": self.kind,
+            "detail": self.detail,
+        }
+
+
+def parse_app_stamp(text: str) -> datetime | None:
+    match = APP_TS.search(text)
+    if not match or match.start() > 8:
+        return None
+    raw = match.group("ts").replace(",", ".").replace(" ", "T")
+    if "." in raw:
+        head, frac = raw.split(".", 1)
+        raw = f"{head}.{frac[:6].ljust(6, '0')}"
+        pattern = "%Y-%m-%dT%H:%M:%S.%f"
+    else:
+        pattern = "%Y-%m-%dT%H:%M:%S"
+    try:
+        return datetime.strptime(raw, pattern)
+    except ValueError:
+        return None
+
+
+def parse_app_events(text: str, source: str) -> list[AppEvent]:
+    """Timeline events of one application log file (comfyui.log, generate.log)."""
+    table = GENERATE_EVENTS if source.startswith("generate") else COMFY_EVENTS
+    events: list[AppEvent] = []
+    for line in text.splitlines():
+        for kind, pattern in table:
+            match = pattern.search(line)
+            if not match:
+                continue
+            at = parse_app_stamp(line)
+            if at is None:
+                break
+            detail = ""
+            groups = match.groupdict()
+            if "seconds" in groups:
+                detail = groups["seconds"] or ""
+            elif "mib" in groups:
+                detail = groups["mib"] or ""
+            elif "vram" in groups:
+                detail = f"{groups['vram']}/{groups['ram']}"
+            elif kind == "generate-step":
+                detail = match.group(0)
+            events.append(AppEvent(at, source, kind, detail))
+            break
+    return events
 
 
 # -- log files ---------------------------------------------------------------

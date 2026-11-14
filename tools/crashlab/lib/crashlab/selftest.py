@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime
 
 from . import parsers
 from . import verdict as verdict_mod
-from .host import Host
+from .host import Host, RunResult
 
 LIST_BOOTS = """\
  -2 b544c54e5a88468aac0af33cbe658f1c Fri 2026-11-13 19:45:20 MSK Fri 2026-11-13 21:50:31 MSK
@@ -20,7 +21,7 @@ FRAMEBUF = (
     "2026-11-13T21:46:18+03:00 vlabe-PC kernel: "
     "[drm:amdgpu_dm_plane_helper_prepare_fb [amdgpu]] *ERROR* Failed to pin framebuffer with error -12"
 )
-KERNEL = "\n".join(
+KERNEL: str = "\n".join(
     [
         PIN.format(id="000000004132ef84"),
         FRAMEBUF,
@@ -130,7 +131,7 @@ class CoredumpTests(unittest.TestCase):
         self.assertEqual(parsers.blame(["#0 0x1 in main () from /usr/bin/app"]), "")
 
 
-PANIC = """\
+PANIC: str = """\
 2026-11-13T22:54:12+03:00 vlabe-PC kernel: BUG: unable to handle page fault for address: ffffc900
 2026-11-13T22:54:12+03:00 vlabe-PC kernel: Oops: 0000 [#1] PREEMPT SMP NOPTI
 2026-11-13T22:54:12+03:00 vlabe-PC kernel: RIP: 0010:amdgpu_vm_bo_update+0x1a/0x40 [amdgpu]
@@ -246,6 +247,249 @@ class VerdictTests(unittest.TestCase):
         result = verdict_mod.decide(self.evidence(kernel=["kernel: hello"], logs=logs))
         self.assertEqual(result.cause, "silent-reset")
         self.assertTrue(any("zero bytes" in line for line in result.evidence))
+
+
+class ClockTests(unittest.TestCase):
+    def test_anchor_subtracts_monotonic_from_realtime(self) -> None:
+        """The RTC can be hours wrong at boot; ``realtime - monotonic`` cannot."""
+        end = datetime(2026, 11, 14, 8, 31, 21, 9687)
+        payload = {
+            "__REALTIME_TIMESTAMP": str(int(end.timestamp()) * 1_000_000 + 9687),
+            "__MONOTONIC_TIMESTAMP": str(3389 * 1_000_000 + 9687),
+        }
+        anchor = parsers.parse_journal_anchor(json.dumps(payload))
+        self.assertIsNotNone(anchor)
+        assert anchor is not None
+        self.assertEqual(anchor.boot_start, datetime(2026, 11, 14, 7, 34, 52))
+        self.assertAlmostEqual(anchor.monotonic_s, 3389.009687)
+
+    def test_anchor_survives_a_list_payload(self) -> None:
+        payload = [
+            {"__REALTIME_TIMESTAMP": "1763105692009687", "__MONOTONIC_TIMESTAMP": "3389009687"},
+            {"__REALTIME_TIMESTAMP": "1763105700000000", "__MONOTONIC_TIMESTAMP": "3397000000"},
+        ]
+        self.assertIsNotNone(parsers.parse_journal_anchor(json.dumps(payload)))
+
+    def test_anchor_rejects_garbage(self) -> None:
+        self.assertIsNone(parsers.parse_journal_anchor("not json"))
+        self.assertIsNone(parsers.parse_journal_anchor("{}"))
+
+    def test_systemd_analyze_rows(self) -> None:
+        text = (
+            "Startup finished in 10.037s (firmware) + 5.187s (loader) + 2.345s (kernel)"
+            " + 15.783s (userspace) = 33.352s\n"
+            "graphical.target reached after 15.2s in userspace.\n"
+        )
+        values = parsers.parse_systemd_analyze(text)
+        self.assertAlmostEqual(values["firmware"], 10.037)
+        self.assertAlmostEqual(values["loader"], 5.187)
+        self.assertAlmostEqual(values["userspace"], 15.783)
+
+
+class SignatureWindowTests(unittest.TestCase):
+    def test_window_keeps_first_last_and_count(self) -> None:
+        lines = [
+            "2026-11-14T08:20:02+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0: 12 pin failed",
+            "2026-11-14T08:21:40+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0: 34 pin failed",
+            "2026-11-14T08:22:35+03:00 vlabe-PC kernel: amdgpu 0000:03:00.0: 56 pin failed",
+        ]
+        window = parsers.signature_windows(lines)["amdgpu pin failed"]
+        self.assertEqual(window.hits, 3)
+        self.assertEqual(window.first, datetime(2026, 11, 14, 8, 20, 2))
+        self.assertEqual(window.last, datetime(2026, 11, 14, 8, 22, 35))
+
+    def test_kfd_teardown_hog_is_a_signature(self) -> None:
+        lines = [
+            "2026-11-14T08:28:57+03:00 vlabe-PC kernel: workqueue: kfd_process_wq_release"
+            " [amdgpu] hogged CPU for >10000us 4 times, consider switching to WQ_UNBOUND"
+        ]
+        self.assertEqual(parsers.count_signatures(lines).get("KFD teardown hog"), 1)
+
+
+class RuledOutTests(unittest.TestCase):
+    def test_watchdog_armed_line(self) -> None:
+        armed, detail = parsers.watchdog_state(
+            [
+                "Nov 14 08:31:44 host systemd[1]: Using hardware watchdog 'iTCO_wdt', version 0, device /dev/watchdog0",
+                "Nov 14 08:31:44 host systemd[1]: Watchdog running with a timeout of 10s.",
+            ]
+        )
+        self.assertTrue(armed)
+        self.assertIn("iTCO_wdt", detail)
+        self.assertIn("10", detail)
+
+    def test_no_watchdog_line_means_not_armed(self) -> None:
+        armed, _detail = parsers.watchdog_state(["Nov 14 08:31:44 host systemd[1]: Reached target basic.target"])
+        self.assertFalse(armed)
+
+    def test_denylisted_modules(self) -> None:
+        lines = [
+            "Nov 14 08:31:53 host systemd-modules-load[322]: Module 'iTCO_wdt' is deny-listed (by kmod)",
+            "Nov 14 08:31:53 host systemd-modules-load[322]: Module 'iTCO_wdt' is deny-listed (by kmod)",
+        ]
+        self.assertEqual(parsers.denylisted_modules(lines), ["iTCO_wdt"])
+
+    def test_blacklist_file(self) -> None:
+        text = "# a comment\nblacklist iTCO_wdt\n# chipset watchdog\nblacklist sp5100_tco\n"
+        rows = parsers.parse_blacklist(text, "/usr/lib/modprobe.d/blacklist.conf")
+        self.assertEqual([module for module, _path in rows], ["iTCO_wdt", "sp5100_tco"])
+
+    def test_pstore_states(self) -> None:
+        skipped = [
+            "Nov 14 08:31:53 host systemd[1]: systemd-pstore.service - Platform Persistent Storage"
+            " Archival was skipped because of an unmet condition check"
+            " (ConditionDirectoryNotEmpty=/sys/fs/pstore)."
+        ]
+        self.assertEqual(parsers.pstore_state(skipped), "empty")
+        self.assertEqual(parsers.pstore_state(["kernel: pstore: Registered efi_pstore"]), "unknown")
+        self.assertEqual(parsers.pstore_state(["kernel: Registered efi_pstore as persistent store backend"]), "unknown")
+
+
+APP_LOG = """\
+2026-11-14T08:28:15.123456+03:00 [INFO] Starting server
+2026-11-14T08:28:15.223456+03:00 [INFO] Total VRAM 12272 MB, total RAM 32056 MB
+2026-11-14T08:28:19.323456+03:00 [INFO] Enabled pinned memory 27959
+2026-11-14T08:28:24.423456+03:00 [INFO] got prompt
+2026-11-14T08:28:56.523456+03:00 [INFO] Prompt executed in 32.1 seconds
+"""
+
+GENERATE_LOG = """\
+2026-11-14T08:28:05+0300 === generate.sh started ===
+2026-11-14T08:28:14+0300 Available generative models on disk:
+2026-11-14T08:28:20+0300 ComfyUI is ready at http://127.0.0.1:8188
+2026-11-14T08:28:21+0300 Text encoders (CLIP):
+"""
+
+
+class AppEventTests(unittest.TestCase):
+    def test_comfyui_events(self) -> None:
+        events = parsers.parse_app_events(APP_LOG, "comfyui.log")
+        kinds = [event.kind for event in events]
+        self.assertEqual(kinds, ["start", "vram", "pinned", "prompt", "done"])
+        pinned = next(event for event in events if event.kind == "pinned")
+        self.assertEqual(pinned.detail, "27959")
+        done = next(event for event in events if event.kind == "done")
+        self.assertEqual(done.detail, "32.1")
+        self.assertEqual(events[0].at, datetime(2026, 11, 14, 8, 28, 15, 123456))
+
+    def test_generate_events(self) -> None:
+        events = parsers.parse_app_events(GENERATE_LOG, "generate.log")
+        kinds = [event.kind for event in events]
+        self.assertEqual(kinds, ["generate-start", "generate-step", "generate-ready", "generate-step"])
+        self.assertEqual(events[1].detail, "Available generative models on disk")
+
+    def test_untimestamped_lines_are_ignored(self) -> None:
+        self.assertEqual(parsers.parse_app_events("  [INFO] got prompt\n", "comfyui.log"), [])
+
+
+class PlatformFreezeTests(unittest.TestCase):
+    def evidence(self) -> verdict_mod.Evidence:
+        """The 2026-11-14 08:31 shape: no panic, no watchdog, 8 s of silence."""
+        ev = verdict_mod.Evidence(
+            kernel=KERNEL.splitlines(),
+            boot_end=datetime(2026, 11, 14, 8, 31, 21),
+            silence_s=8.0,
+            panic_record="empty",
+            pstore_note="efi_pstore registered at the next boot and /sys/fs/pstore was empty",
+            watchdog_armed=False,
+            watchdog_detail="no watchdog device in that boot",
+            watchdog_denylist=["iTCO_wdt"],
+            blacklists={"iTCO_wdt": "/usr/lib/modprobe.d/blacklist_x.conf"},
+            events=[
+                parsers.AppEvent(datetime(2026, 11, 14, 7, 35, 47), "session.log", "session-start"),
+                parsers.AppEvent(datetime(2026, 11, 14, 8, 30, 56), "session.log", "session-start"),
+            ],
+        )
+        ev.last_kernel = datetime(2026, 11, 14, 8, 30, 26)
+        ev.counts = parsers.count_signatures(ev.kernel)
+        ev.samples = parsers.signature_samples(ev.kernel)
+        ev.windows = parsers.signature_windows(ev.kernel)
+        return ev
+
+    def test_verdict_names_an_external_reset(self) -> None:
+        result = verdict_mod.decide(self.evidence())
+        self.assertEqual(result.cause, "platform-freeze")
+        self.assertIn("external", result.summary)
+        self.assertTrue(any("2 GPU contexts" in line for line in [result.summary]))
+
+    def test_checks_rule_out_panic_and_watchdog(self) -> None:
+        ev = self.evidence()
+        verdict_mod.decide(ev)
+        rows = {check.label: check.status for check in ev.checks}
+        self.assertEqual(rows["kernel panic"], "ruled out")
+        self.assertEqual(rows["hardware watchdog"], "ruled out")
+        self.assertEqual(rows["host memory"], "ruled out")
+
+    def test_no_panic_evidence_keeps_it_unproven(self) -> None:
+        ev = self.evidence()
+        ev.panic_record = "unknown"
+        self.assertEqual(verdict_mod.decide(ev).cause, "silent-reset")
+
+
+class DriftTests(unittest.TestCase):
+    SESSIONS = """\
+--- session 2026-11-13T22:16:11+03:00 (pid 6140) ---
+2026-11-13T22:16:11+0300 snapshot: mem free 23081 MiB, available 27179 MiB, swap 0/0 MiB, load 3.93 3.71 1.90
+--- session 2026-11-13T22:17:16+03:00 (pid 7362) ---
+2026-11-13T22:17:16+0300 snapshot: mem free 10732 MiB, available 25476 MiB, swap 0/16383 MiB, load 5.35 4.16 2.18
+"""
+
+    def test_pinned_jump_names_the_swapfile(self) -> None:
+        ev = verdict_mod.Evidence(
+            boot_start=datetime(2026, 11, 14, 7, 34, 52),
+            boot_list_start="Sat 2026-11-14 10:34:57 MSK",
+            sessions=parsers.parse_sessions(self.SESSIONS),
+            pinned=[
+                (datetime(2026, 11, 13, 22, 16, 12), 15671),
+                (datetime(2026, 11, 13, 22, 17, 21), 27959),
+            ],
+        )
+        rows = verdict_mod.drift(ev)
+        self.assertTrue(any("15671 -> 27959" in row for row in rows), rows)
+        self.assertTrue(any("ram-4GiB" in row for row in rows), rows)
+        self.assertTrue(any("wall clock was off" in row for row in rows), rows)
+
+    def test_swap_transition_without_history_is_silent(self) -> None:
+        ev = verdict_mod.Evidence(
+            pinned=[(datetime(2026, 11, 13, 22, 16, 12), 1), (datetime(2026, 11, 13, 22, 17, 21), 2)]
+        )
+        self.assertEqual(verdict_mod._swap_transition(ev, datetime(2026, 11, 13, 22, 17, 21)), "")
+
+
+BOOTS_SKEW = """\
+ -1 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa Fri 2026-11-13 21:51:06 MSK Fri 2026-11-13 21:51:53 MSK
+  0 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb Sat 2026-11-14 10:34:57 MSK Sat 2026-11-14 08:31:21 MSK
+"""
+
+
+class BootRowTests(unittest.TestCase):
+    def test_rtc_skewed_boot_uses_the_monotonic_start(self) -> None:
+        end = datetime(2026, 11, 14, 8, 31, 21, 9687)
+        anchor = json.dumps(
+            {
+                "__REALTIME_TIMESTAMP": str(int(end.timestamp()) * 1_000_000 + 9687),
+                "__MONOTONIC_TIMESTAMP": str(3389 * 1_000_000 + 9687),
+            }
+        )
+
+        def runner(argv, _timeout=60.0):
+            joined = " ".join(argv)
+            if "--list-boots" in joined:
+                return RunResult(0, BOOTS_SKEW)
+            if "-o json" in joined:
+                return RunResult(0, anchor)
+            if "-n 10" in joined:
+                return RunResult(0, "systemd[1]: Reached target poweroff.target")
+            return RunResult(0, "")
+
+        from . import __main__ as cli
+
+        rows = cli.boot_rows(Host(runner=runner))
+        skewed = next(row for row in rows if row["boot"]["index"] == 0)
+        self.assertTrue(skewed["clock_skew"])
+        self.assertEqual(skewed["real_start"], "2026-11-14T07:34:52")
+        self.assertAlmostEqual(skewed["runtime_s"], 3389.009687)
+        self.assertIn("(clock list:", cli.format_boot_row(skewed))
 
 
 def run() -> int:

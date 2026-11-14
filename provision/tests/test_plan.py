@@ -63,7 +63,7 @@ def host_after_system(config, plan_obj):
             packages.update(action.params["packages"])
         elif action.id == "journald-dir":
             dirs.add(action.params["argv"][-1])
-        elif action.id == "watchdog-load":
+        elif action.id == "watchdog-load" or action.id == "force-watchdog-enable":
             listdir["/sys/class/watchdog"] = ["watchdog0"]
         elif action.id == "sysctl-apply":
             sysctl.update(layout.SYSCTL_VALUES)

@@ -15,8 +15,9 @@
 #   ./provision.sh doctor       # print diagnostics
 #   ./provision.sh update       # move ComfyUI/Manager to the configured refs
 #   ./provision.sh swap         # create a 16 GB swap file (opt-in)
-#   ./provision.sh test         # bash -n, shellcheck, ruff, pyright and the
-#                               # Python unit + mandatory e2e tests
+#   ./provision.sh test         # bash -n, shellcheck, ruff, pyright, the
+#                               # Python unit + crashlab self-tests and the
+#                               # mandatory e2e test
 #
 # Exit codes: 0 ok, 1 error, 2 usage, 3 reboot/re-login required,
 #             4 missing prerequisite, 5 verification failed.
@@ -360,6 +361,14 @@ cmd_test() {
     elif PYTHONPATH="$PROVISION_LIB" PYTHONDONTWRITEBYTECODE=1 "$PYTHON_BIN" -m unittest discover \
         -s "$HERE/provision/tests" -t "$HERE/provision/tests"; then
         ok "python tests (unittest fallback)"
+    else
+        failed=1
+    fi
+
+    # crashlab is stdlib-only and read-only; its self-test takes milliseconds
+    # and protects the forensics path that has to work when provision/ is broken.
+    if "$HERE/tools/crashlab/crashlab" self-test; then
+        ok "crashlab self-test"
     else
         failed=1
     fi

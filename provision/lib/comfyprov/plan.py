@@ -935,6 +935,125 @@ def _crash_logging_actions(planner: Planner, plan: Plan) -> None:
         satisfied=facts.pstore_enabled,
     )
 
+    # --- force-load watchdog despite modprobe.d denylist ---
+    # modules-load.d refuses deny-listed modules; modprobe itself ignores the
+    # blacklist. A oneshot unit runs modprobe directly before any GPU workload.
+    fw_mod, _fw_reason = layout.watchdog_module(facts.isa_bridge, facts.acpi_wdat)
+    fw_override_dir = layout.FORCE_WATCHDOG_DIR
+    planner.mkdir(
+        plan,
+        fw_override_dir,
+        mode="755",
+    )
+    planner.write(
+        plan,
+        layout.FORCE_WATCHDOG_SERVICE,
+        layout.FORCE_WATCHDOG_SERVICE_CONTENT.format(module=fw_mod),
+        mode="644",
+        sudo=True,
+        current=facts.file("force_watchdog_service"),
+    )
+    planner.write(
+        plan,
+        fw_override_dir / "override.conf",
+        layout.FORCE_WATCHDOG_OVERRIDE_CONTENT.format(module=fw_mod),
+        mode="644",
+        sudo=True,
+        current=facts.file("force_watchdog_override"),
+    )
+    planner.exec(
+        plan,
+        "force-watchdog-enable",
+        f"Enable oneshot force-load of {fw_mod}",
+        ["systemctl", "enable", "--now", "comfyui-force-watchdog.service"],
+        sudo=True,
+        allow_fail=True,
+        satisfied=facts.watchdog_present,
+    )
+
+    # --- netconsole: out-of-band kernel log capture ---
+    # Sends printk over UDP to a second machine. The only way to read the
+    # last lines of a true platform freeze.
+    planner.write(
+        plan,
+        layout.NETCONSOLE_MODULE_CONF,
+        layout.NETCONSOLE_MODULE_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("netconsole_module"),
+    )
+    planner.write(
+        plan,
+        layout.NETCONSOLE_CONF,
+        "# ComfyUI / netconsole parameters\n# options netconsole netconsole=@<src>/<eth>,@<dst>/<port>\n",
+        mode="644",
+        sudo=True,
+        current=facts.file("netconsole_conf"),
+    )
+    planner.exec(
+        plan,
+        "netconsole-load",
+        "Load netconsole module",
+        ["modprobe", "netconsole"],
+        sudo=True,
+        allow_fail=True,
+        satisfied=bool(facts.file("netconsole_module")),
+    )
+
+    # --- ramoops: persistent RAM for pstore ---
+    # Reserves a small region of RAM that survives a reset so the last dmesg
+    # lines can be read after reboot, even if journald never syncs.
+    planner.write(
+        plan,
+        layout.RAMOOPS_MODULE_CONF,
+        layout.RAMOOPS_MODULE_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("ramoops_module"),
+    )
+    planner.write(
+        plan,
+        layout.RAMOOPS_CONF,
+        layout.RAMOOPS_PARAMS_CONTENT,
+        mode="644",
+        sudo=True,
+        current=facts.file("ramoops_conf"),
+    )
+    planner.exec(
+        plan,
+        "ramoops-load",
+        "Load ramoops module",
+        ["modprobe", "ramoops"],
+        sudo=True,
+        allow_fail=True,
+        satisfied=bool(facts.file("ramoops_module")),
+    )
+
+    # --- crash doctor: automated root-cause determination ---
+    planner.mkdir(
+        plan,
+        layout.CRASH_DOCTOR_DIR,
+        mode="755",
+    )
+    planner.write(
+        plan,
+        layout.CRASH_DOCTOR,
+        layout.CRASH_DOCTOR_CONTENT,
+        mode="755",
+        sudo=True,
+        current=facts.file("crash_doctor"),
+    )
+
+    # --- log sync script: fsync logs every LOG_SYNC_INTERVAL seconds ---
+    planner.write(
+        plan,
+        layout.LOG_SYNC_SCRIPT,
+        layout.LOG_SYNC_CONTENT,
+        mode="755",
+        sudo=True,
+        current=facts.file("log_sync"),
+    )
+
 
 def status(config: Config, facts: Facts, probe: Probe) -> list[Plan]:
     """Read-only summary used by ``provision.sh status``."""

@@ -249,12 +249,15 @@ System level (part of the `system` step, needs sudo):
 - `systemd-pstore` collects firmware/ramoops records left by a reset.
 
 Reading the evidence: `./tools/crashlab/crashlab report` (see
-`.agents/skills/crash-forensics/SKILL.md`) prints a cause, the evidence lines,
-the signature counts of the last three boots, launcher sessions, core dumps with
-a decoded signal and `blame`, and the newest log tails. `crashlab` is
-deliberately independent of `provision/` and the venv: it must work when the
-things it investigates are broken. It never writes to the machine beyond an
-optional `--out FILE`.
+`.agents/skills/crash-forensics/SKILL.md`) is the single 60-second entry point.
+It prints the verdict, a "decided by" checklist (panic, watchdog, hardware, host
+memory, kernel-stopped-first, process abort, GPU signatures), the timeline of the
+boot, configuration drift, the signature counts of the last three boots and the
+next experiment; `--brief` and `--full` shrink or expand it, `--json` is for
+scripts. `crashlab boots` repairs RTC-skewed boot timestamps with the monotonic
+clock. `crashlab` is deliberately independent of `provision/` and the venv: it
+must work when the things it investigates are broken. It never writes to the
+machine beyond an optional `--out FILE`.
 
 ## Git and the pre-commit gate
 
@@ -264,9 +267,9 @@ optional `--out FILE`.
 - Hooks are versioned in `.githooks/` and enabled with
   `git config core.hooksPath .githooks`.
 - `.githooks/pre-commit` calls `./provision.sh test`, which runs `bash -n`,
-  `shellcheck`, `ruff format --check`, `ruff check`, `pyright`, `pytest` and
-  the mandatory e2e test. Keep that single entry point; do not duplicate the
-  check list in the hook.
+  `shellcheck`, `ruff format --check`, `ruff check`, `pyright`, `pytest`,
+  `crashlab self-test` and the mandatory e2e test. Keep that single entry point;
+  do not duplicate the check list in the hook.
 - The unit pytest pass runs with `-m "not e2e"`; the e2e marker is run exactly
   once, afterwards. Never merge them back into one full-suite run: every extra
   ComfyUI start/stop cycle is GPU context churn on this amdgpu stack

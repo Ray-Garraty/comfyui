@@ -219,6 +219,14 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
         "modules_load": probe.read_text(layout.MODULES_LOAD_FILE),
         "rsyslog": probe.read_text(layout.RSYSLOG_DROPIN),
         "udev": probe.read_text(layout.UDEV_FILE),
+        "force_watchdog_service": probe.read_text(layout.FORCE_WATCHDOG_SERVICE),
+        "force_watchdog_override": probe.read_text(layout.FORCE_WATCHDOG_DIR / "override.conf"),
+        "netconsole_module": probe.read_text(layout.NETCONSOLE_MODULE_CONF),
+        "netconsole_conf": probe.read_text(layout.NETCONSOLE_CONF),
+        "ramoops_module": probe.read_text(layout.RAMOOPS_MODULE_CONF),
+        "ramoops_conf": probe.read_text(layout.RAMOOPS_CONF),
+        "crash_doctor": probe.read_text(layout.CRASH_DOCTOR),
+        "log_sync": probe.read_text(layout.LOG_SYNC_SCRIPT),
         "constraints": probe.read_text(state / "constraints.txt"),
         "icon": probe.read_text(config.icon_path),
         "desktop_entry": probe.read_text(config.desktop_entry_path),
@@ -280,6 +288,8 @@ def collect(config: Config, probe: Probe | None = None) -> Facts:
                 layout.JOURNALD_DROPIN.parent,
                 layout.RSYSLOG_DROPIN.parent,
                 layout.CRASH_SYSCTL_FILE.parent,
+                layout.FORCE_WATCHDOG_DIR,
+                layout.CRASH_DOCTOR_DIR,
             )
             if probe.is_dir(path)
         ),

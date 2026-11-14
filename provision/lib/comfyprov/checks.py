@@ -198,5 +198,5 @@ def doctor(config: Config, facts: Facts, probe: Probe, client: HttpClient | None
     except (HttpError, ValueError):
         findings.append(Finding(WARN, "server", "not running"))
 
-    findings.extend(crashlog.findings(config, probe))
+    findings.extend(crashlog.findings(config, probe, facts))
     return findings

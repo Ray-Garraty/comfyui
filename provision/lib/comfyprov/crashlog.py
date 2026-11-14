@@ -112,7 +112,7 @@ def collect(probe: Probe, boot: str = "-1") -> Evidence:
     )
 
 
-def findings(config: Config, probe: Probe, evidence: Evidence | None = None) -> list[Finding]:
+def findings(config: Config, probe: Probe, facts, evidence: Evidence | None = None) -> list[Finding]:
     """Doctor-style findings about the crash-capture chain."""
     evidence = evidence if evidence is not None else collect(probe)
     results: list[Finding] = []
@@ -152,6 +152,57 @@ def findings(config: Config, probe: Probe, evidence: Evidence | None = None) -> 
         if count:
             level = FAIL if signature.name in ("hardware error", "out of memory") else WARN
             results.append(Finding(level, f"previous boot: {signature.name}", f"{count} line(s)"))
+
+    # --- new crash-capture features ---
+    fw_service = probe.read_text(layout.FORCE_WATCHDOG_SERVICE)
+    if fw_service and "modprobe" in fw_service:
+        wd = "present" if facts.watchdog_present else "absent"
+        results.append(
+            Finding(
+                OK if facts.watchdog_present else WARN,
+                "force-watchdog",
+                f"oneshot unit will modprobe the watchdog despite denylist (watchdog device: {wd})",
+            )
+        )
+    else:
+        results.append(
+            Finding(
+                WARN,
+                "force-watchdog",
+                "not installed; run './provision.sh system' (needed when iTCO_wdt is deny-listed)",
+            )
+        )
+
+    nc = probe.read_text(layout.NETCONSOLE_MODULE_CONF)
+    if nc:
+        results.append(Finding(OK, "netconsole", "module configured for out-of-band kernel log capture"))
+    else:
+        results.append(
+            Finding(
+                WARN,
+                "netconsole",
+                "not configured; the only way to read the last lines of a platform freeze",
+            )
+        )
+
+    rp = probe.read_text(layout.RAMOOPS_MODULE_CONF)
+    if rp:
+        results.append(Finding(OK, "ramoops", "persistent RAM backend configured for pstore"))
+    else:
+        results.append(Finding(WARN, "ramoops", "not configured; no post-reset dmesg tail"))
+
+    cd = probe.read_text(layout.CRASH_DOCTOR)
+    if cd:
+        results.append(Finding(OK, "crash-doctor", "installed at /usr/local/bin/crash-doctor"))
+    else:
+        results.append(
+            Finding(
+                WARN,
+                "crash-doctor",
+                "not installed; run './provision.sh system' for automated root cause",
+            )
+        )
+
     return results
 
 
