@@ -6,27 +6,37 @@ Never touches the real host, network, or sudo. Uses fake filesystem
 
 from __future__ import annotations
 
+import io
 import json
+import os
 import struct
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any, ClassVar
 from unittest import mock
 
 from helpers import png_bytes
 
 from comfyprov.generate import (
     ComfyUIClient,
+    GeneratedImage,
     GenerationSettings,
+    LogTee,
+    _ask_yn,
     _extract_float,
     _extract_int,
     _extract_str,
     _parse_png_parameters,
+    _report_progress,
     build_workflow,
     discover_models,
     import_metadata,
     interactive,
+    interactive_round,
+    main,
     run_generation,
+    write_private,
 )
 
 # ---------------------------------------------------------------------------
@@ -375,10 +385,41 @@ class TestInteractive(unittest.TestCase):
         self.assertEqual(settings.sampler, "euler")
         self.assertEqual(settings.scheduler, "simple")
         self.assertEqual(settings.seed, 42)
+        self.assertFalse(settings.random_seed)
         self.assertEqual(settings.prompt, "a cat")
         self.assertEqual(settings.neg_prompt, "")
         self.assertEqual(settings.use_tiled_vae, True)
         self.assertEqual(settings.tile_size, 512)
+
+    def test_interactive_random_seed_is_flagged_and_drawn(self):
+        inputs = iter(
+            [
+                "1",
+                "1",
+                "1",
+                "512x512",
+                "1",
+                "4",
+                "1.0",
+                "1",
+                "1",
+                "-1",  # random seed
+                "a cat",
+                "",
+            ]
+        )
+        with (
+            mock.patch("builtins.input", lambda _: next(inputs)),
+            mock.patch("random.randint", return_value=555) as draw,
+        ):
+            settings = interactive(
+                available_models=["model.safetensors"],
+                available_clip_models=["clip.safetensors"],
+                available_vae_models=["vae.safetensors"],
+            )
+        draw.assert_called_once_with(0, 18446744073709551615)
+        self.assertTrue(settings.random_seed)
+        self.assertEqual(settings.seed, 555)
 
     def test_interactive_empty_prompt_retries_until_nonempty(self):
         inputs = iter(
@@ -407,6 +448,195 @@ class TestInteractive(unittest.TestCase):
             )
         self.assertEqual(settings.prompt, "a cat")
         self.assertEqual(settings.neg_prompt, "")
+
+
+# ---------------------------------------------------------------------------
+# Further rounds: same settings, only count and prompts are asked
+# ---------------------------------------------------------------------------
+
+
+def _settings(**overrides: Any) -> GenerationSettings:
+    values: dict[str, Any] = {
+        "model": "model.safetensors",
+        "width": 512,
+        "height": 512,
+        "count": 1,
+        "steps": 4,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
+        "seed": 7,
+        "prompt": "a cat",
+        "neg_prompt": "",
+        "clip_model": "clip.safetensors",
+        "vae_model": "vae.safetensors",
+        "use_tiled_vae": False,
+        "tile_size": 512,
+    }
+    values.update(overrides)
+    return GenerationSettings(**values)
+
+
+class TestAskYn(unittest.TestCase):
+    def test_yes(self):
+        with mock.patch("builtins.input", return_value="y"):
+            self.assertTrue(_ask_yn("Generate more images?"))
+        with mock.patch("builtins.input", return_value="YES"):
+            self.assertTrue(_ask_yn("Generate more images?"))
+
+    def test_no(self):
+        with mock.patch("builtins.input", return_value="n"):
+            self.assertFalse(_ask_yn("Generate more images?"))
+        with mock.patch("builtins.input", return_value="No"):
+            self.assertFalse(_ask_yn("Generate more images?"))
+
+    def test_empty_answer_uses_default(self):
+        with mock.patch("builtins.input", return_value=""):
+            self.assertFalse(_ask_yn("Generate more images?", default=False))
+        with mock.patch("builtins.input", return_value=""):
+            self.assertTrue(_ask_yn("Generate more images?", default=True))
+
+    def test_invalid_answer_is_asked_again(self):
+        with mock.patch("builtins.input", side_effect=["maybe", "y"]) as ask:
+            self.assertTrue(_ask_yn("Generate more images?"))
+        self.assertEqual(ask.call_count, 2)
+
+    def test_end_of_input_means_the_default(self):
+        """The e2e test pipes its answers and closes stdin: no traceback allowed."""
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(_ask_yn("Generate more images?", default=False))
+
+
+class TestInteractiveRound(unittest.TestCase):
+    def test_enter_repeats_the_previous_round(self):
+        previous = _settings(count=2, prompt="a cat", neg_prompt="blurry", seed=42)
+        answers = iter(["", "", ""])  # count, positive prompt, negative prompt
+        with mock.patch("builtins.input", lambda _: next(answers)):
+            result = interactive_round(previous)
+        self.assertEqual(result, previous)
+
+    def test_asks_only_count_and_prompts(self):
+        previous = _settings(count=2, steps=9, cfg=3.5, width=640, height=480, sampler="heun", scheduler="karras")
+        answers = iter(["3", "a dog", "ugly"])
+        with mock.patch("builtins.input", lambda _: next(answers)):
+            result = interactive_round(previous)
+        self.assertEqual(result.count, 3)
+        self.assertEqual(result.prompt, "a dog")
+        self.assertEqual(result.neg_prompt, "ugly")
+        self.assertEqual(
+            (result.model, result.width, result.height, result.steps, result.cfg, result.sampler, result.scheduler),
+            (previous.model, 640, 480, 9, 3.5, "heun", "karras"),
+        )
+
+    def test_fixed_seed_is_kept(self):
+        previous = _settings(seed=1234)
+        answers = iter(["", "", ""])
+        with (
+            mock.patch("builtins.input", lambda _: next(answers)),
+            mock.patch("random.randint") as draw,
+        ):
+            result = interactive_round(previous)
+        draw.assert_not_called()
+        self.assertEqual(result.seed, 1234)
+
+    def test_random_seed_is_drawn_again(self):
+        previous = _settings(seed=1234, random_seed=True)
+        answers = iter(["", "", ""])
+        with (
+            mock.patch("builtins.input", lambda _: next(answers)),
+            mock.patch("random.randint", return_value=999) as draw,
+        ):
+            result = interactive_round(previous)
+        draw.assert_called_once_with(0, 18446744073709551615)
+        self.assertEqual(result.seed, 999)
+        self.assertTrue(result.random_seed)
+
+    def test_previous_prompts_are_shown_but_never_logged(self):
+        """Prompts are user content: the log file must not receive them."""
+        terminal, log = io.StringIO(), io.StringIO()
+        tee = LogTee(terminal, log)
+        previous = _settings(prompt="secret positive", neg_prompt="secret negative")
+        answers = iter(["", "", ""])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            result = interactive_round(previous)
+        self.assertEqual(result.prompt, "secret positive")
+        self.assertIn("secret positive", terminal.getvalue())
+        self.assertIn("secret negative", terminal.getvalue())
+        self.assertNotIn("secret", log.getvalue())
+
+
+class TestProgressOutput(unittest.TestCase):
+    def test_progress_ticks_are_terminal_only(self) -> None:
+        terminal, log = io.StringIO(), io.StringIO()
+        tee = LogTee(terminal, log)
+        with mock.patch("sys.stdout", tee):
+            _report_progress(46)
+            _report_progress(47)
+            write_private("\n")
+        self.assertIn("47s elapsed", terminal.getvalue())
+        self.assertEqual(log.getvalue(), "", "the once-per-second repaint must not be logged")
+
+    def test_private_output_without_a_tee_still_reaches_stdout(self) -> None:
+        stream = io.StringIO()
+        with mock.patch("sys.stdout", stream):
+            write_private("plain\n")
+        self.assertEqual(stream.getvalue(), "plain\n")
+
+
+class TestMainRounds(unittest.TestCase):
+    ARGV: ClassVar[list[str]] = ["http://127.0.0.1:8188", "/tmp/out", "", "", ""]
+
+    def test_declining_another_round_runs_once(self) -> None:
+        first = _settings()
+        produced = [GeneratedImage(path="/tmp/out/0001.png", filename="0001.png")]
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("comfyprov.generate.interactive", return_value=first),
+            mock.patch("comfyprov.generate.run_generation", return_value=produced) as run,
+            mock.patch("comfyprov.generate._ask_yn", return_value=False) as ask_more,
+        ):
+            self.assertEqual(main(self.ARGV), 0)
+        self.assertEqual(run.call_count, 1)
+        ask_more.assert_called_once()
+
+    def test_another_round_reuses_settings_and_runs_again(self) -> None:
+        first = _settings(count=1, prompt="a cat", neg_prompt="blurry")
+        second = _settings(count=2, prompt="a dog", neg_prompt="ugly")
+        produced = [GeneratedImage(path="/tmp/out/0001.png", filename="0001.png")]
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("comfyprov.generate.interactive", return_value=first),
+            mock.patch("comfyprov.generate.interactive_round", return_value=second) as next_round,
+            mock.patch("comfyprov.generate.run_generation", side_effect=[produced, produced]) as run,
+            mock.patch("comfyprov.generate._ask_yn", side_effect=[True, False]),
+        ):
+            self.assertEqual(main(self.ARGV), 0)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual([call.args[1] for call in run.call_args_list], [first, second])
+        next_round.assert_called_once_with(first)
+
+    def test_model_from_argv_applies_to_every_round(self) -> None:
+        first = _settings()
+        produced = [GeneratedImage(path="/tmp/out/0001.png", filename="0001.png")]
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("comfyprov.generate.interactive", return_value=first),
+            mock.patch("comfyprov.generate.run_generation", return_value=produced) as run,
+            mock.patch("comfyprov.generate._ask_yn", return_value=False),
+        ):
+            self.assertEqual(main([*self.ARGV, "explicit.safetensors"]), 0)
+        self.assertEqual(run.call_args.args[1].model, "explicit.safetensors")
+
+    def test_generation_error_exits_with_one(self) -> None:
+        first = _settings()
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("comfyprov.generate.interactive", return_value=first),
+            mock.patch("comfyprov.generate.run_generation", side_effect=RuntimeError("boom")),
+            mock.patch("comfyprov.generate._ask_yn") as ask_more,
+        ):
+            self.assertEqual(main(self.ARGV), 1)
+        ask_more.assert_not_called()
 
 
 if __name__ == "__main__":

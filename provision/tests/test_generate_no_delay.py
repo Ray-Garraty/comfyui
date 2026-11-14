@@ -37,7 +37,7 @@ from pathlib import Path
 from unittest import mock
 
 from comfyprov import generate
-from comfyprov.generate import LogTee, _ask, _select_from_list, install_log_tee
+from comfyprov.generate import LogTee, _ask, _ask_yn, _select_from_list, install_log_tee
 
 INSTALL_DIR = Path(__file__).resolve().parents[2]
 PROVISION_LIB = INSTALL_DIR / "provision" / "lib"
@@ -151,13 +151,27 @@ class LogTeeTests(unittest.TestCase):
         self.assertTrue(lines[0].endswith("Select [1-1]: "))
 
     def test_carriage_return_progress_stays_one_log_line(self) -> None:
-        """The generation progress redraws with \\r; the log must stay readable."""
+        """Writing with \\r through write() still keeps the log readable."""
         for elapsed in range(3):
-            self.tee.write(f"\rGenerating… {elapsed}s elapsed")
+            self.tee.write(f"\rstatus {elapsed}")
         self.tee.write("\n")
         lines = _log_lines(self.log.getvalue())
         self.assertEqual(len(lines), 1)
         self.assertRegex(lines[0], TIMESTAMP_RE)
+
+    def test_private_writes_never_reach_the_log(self) -> None:
+        """Progress repaints are terminal-only: the log must not tick every second."""
+        for elapsed in range(3):
+            self.tee.write_private(f"\rGenerating… {elapsed}s elapsed")
+        self.tee.write_private("\n")
+        self.assertIn("2s elapsed", self.stream.getvalue())
+        self.assertEqual(self.log.getvalue(), "", "private output must not be logged")
+
+    def test_write_private_flushes_the_terminal(self) -> None:
+        before = self.stream.flushes
+        self.assertEqual(self.tee.write_private("secret"), 6)
+        self.assertGreater(self.stream.flushes, before)
+        self.assertEqual(self.tee.write_private(""), 0)
 
     def test_write_returns_character_count(self) -> None:
         """print() expects the number of characters written."""
@@ -352,6 +366,14 @@ class PromptLatencyTests(unittest.TestCase):
         self.assertIn(b"ANSWER=a cat", stdout)
         self.assertIn("Prompt: ", log)
         self.assertIn("ANSWER=a cat", log)
+
+    def test_ask_yn_flushes_stdout_before_reading(self) -> None:
+        """The "generate more?" question is a prompt like any other."""
+        stream = RecordingStream()
+        with mock.patch("sys.stdout", stream), mock.patch("builtins.input", return_value="y") as ask:
+            self.assertTrue(_ask_yn("Generate more images with the same settings?"))
+        self.assertGreater(stream.flushes, 0)
+        ask.assert_called_once_with("Generate more images with the same settings? (y/n) [n]: ")
 
 
 _TTY_BOOTSTRAP = """

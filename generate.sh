@@ -6,7 +6,10 @@
 # and is covered by provision/tests/test_generate.py.
 #
 # This script only: sources configuration, checks prerequisites, ensures
-# ComfyUI is running, and executes the Python module.
+# ComfyUI is running, and executes the Python module, which keeps prompting for
+# further rounds (same settings, new count/prompts) until the user answers "n".
+# The server is stopped below only after the generator has exited, so rounds
+# reuse the loaded model and VAE.
 #
 # Usage: ./generate.sh
 #
@@ -160,6 +163,8 @@ set -e
 # ---------------------------------------------------------------------------
 # Graceful exit of ComfyUI if we started it
 # ---------------------------------------------------------------------------
+# Reached only after the generator exited, i.e. after the last round: the
+# Python module keeps looping on "generate more images?" while the server runs.
 if [[ "$COMFYUI_WAS_STARTED" == "1" && -n "${COMFYUI_PID:-}" ]]; then
     log "Stopping ComfyUI (PID $COMFYUI_PID) after generation completes..."
     kill "$COMFYUI_PID" 2>/dev/null || true

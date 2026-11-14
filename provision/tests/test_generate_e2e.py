@@ -55,8 +55,10 @@ def _diagnostics() -> str:
 
 
 # Interactive answers, in prompt order: model, CLIP, VAE, size, count, steps,
-# cfg, sampler, scheduler, seed, prompt, negative prompt.
-ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", "a cute cat", ""]) + "\n"
+# cfg, sampler, scheduler, seed, prompt, negative prompt, and finally whether to
+# generate another round ("n"). The EOF right after it is an answer too, but
+# saying "n" explicitly keeps the round contract under test.
+ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", "a cute cat", "", "n"]) + "\n"
 
 
 @pytest.mark.e2e

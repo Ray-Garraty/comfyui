@@ -142,6 +142,14 @@ outcomes.
 `--no-mount`, `--no-sg`, `--reserve-vram`, `--log-level`, `--dry-run`,
 `-- <extra ComfyUI args>`.
 
+`generate.sh` is interactive. After a successful round it asks `Generate more
+images with the same settings? (y/n) [n]`; answering `y` keeps the running
+ComfyUI and asks only for the image count and the positive/negative prompts,
+defaulting to the previous round's values (Enter repeats them). A round started
+from seed `-1` draws a new seed, a fixed seed is kept. The server started by
+`generate.sh` is stopped only after the generator exits (after `n`/Ctrl-D), so
+further rounds reuse the loaded model and VAE.
+
 ## Reboot flow (important)
 
 `usermod -aG render,video` changes the database, not the running session. The
@@ -220,6 +228,9 @@ Runtime (user level, no sudo):
 - `py snapshot` (`comfyprov.crashlog.snapshot`) prints RSS/swap/load plus
   `mem_info_vram_*` and `mem_info_gtt_*`; the launcher and the generator append
   it to their logs at start and at exit.
+- User prompts and the once-per-second `Generating…` repaint are terminal-only
+  (`comfyprov.generate.write_private`): `logs/generate.log` records phases,
+  timings, produced paths and host state, never prompt text or the ticker.
 - `start-comfyui.sh` and `generate.sh` run a `sync -f <log files>` loop every
   `LOG_SYNC_INTERVAL` seconds; the loop exits when its parent process is gone.
 - `PYTHONFAULTHANDLER=1` is exported so a native crash prints a traceback.

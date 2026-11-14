@@ -73,6 +73,19 @@ class LogTee(io.TextIOBase):
             self._write_log(text)
         return len(text)
 
+    def write_private(self, text: str) -> int:
+        """Write to the terminal only, never to the log file.
+
+        Prompts are user content and must not be persisted: the log is meant
+        for phases, timings and host state.
+        """
+        if not text:
+            return 0
+        with self._lock:
+            self._stream.write(text)
+            self._stream.flush()
+        return len(text)
+
     def flush(self) -> None:
         with self._lock:
             self._stream.flush()
@@ -162,9 +175,30 @@ def install_log_tee(log_path: str | os.PathLike[str] | None) -> LogTee | None:
     return tee
 
 
+def write_private(text: str) -> None:
+    """Write ``text`` to the terminal only, never to the log file.
+
+    Two kinds of output are not persisted: user prompts (private content) and
+    the once-per-second ``Generating…`` repaint (hundreds of near-identical
+    lines that bury the phases). The log keeps what is needed after a crash:
+    phases, timings, produced paths and host state.
+    """
+    stream = sys.stdout
+    private = getattr(stream, "write_private", None)
+    if callable(private):
+        private(text)
+        return
+    stream.write(text)
+    stream.flush()
+
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
+
+
+# Seed range accepted by KSampler (unsigned 64-bit).
+MAX_SEED = 18446744073709551615
 
 
 @dataclass(frozen=True)
@@ -184,6 +218,9 @@ class GenerationSettings:
     vae_model: str
     use_tiled_vae: bool
     tile_size: int
+    # True when the user asked for a random seed (-1). A further round then
+    # draws a new one instead of repeating the previous images.
+    random_seed: bool = False
 
 
 @dataclass(frozen=True)
@@ -502,11 +539,56 @@ def run_generation(
 # ---------------------------------------------------------------------------
 
 
+def _draw_seed() -> int:
+    """Return a fresh random seed for a round the user asked to randomise."""
+    import random
+
+    return random.randint(0, MAX_SEED)
+
+
 def _ask(prompt: str, default: str | None = None) -> str:
     prompt = f"{prompt} [default {default}]: " if default is not None else f"{prompt}: "
     sys.stdout.flush()
     value = input(prompt)
     return value if value.strip() else (default or "")
+
+
+def _ask_yn(question: str, default: bool = False) -> bool:
+    """Ask a yes/no question.
+
+    End of input (Ctrl-D, a closed pipe, a non-interactive caller) is an answer
+    too: it means ``default`` and lets the script finish cleanly instead of
+    dying with an EOFError traceback.
+    """
+    marker = "y" if default else "n"
+    while True:
+        sys.stdout.flush()
+        try:
+            raw = input(f"{question} (y/n) [{marker}]: ")
+        except EOFError:
+            print()
+            return default
+        answer = raw.strip().lower()
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+        print(f"Invalid answer '{raw}', expected 'y' or 'n'")
+
+
+def _ask_reuse(label: str, previous: str) -> str:
+    """Ask for a text value; an empty answer keeps ``previous``.
+
+    Prompts are long tag lists, so the previous value is printed on its own
+    line: ``Prompt [default <everything the user typed>]:`` would not fit.
+    """
+    if previous:
+        write_private(f"Previous {label}: {previous}\n")
+    sys.stdout.flush()
+    raw = input(f"{label.capitalize()} [Enter = repeated]: ")
+    return raw if raw.strip() else previous
 
 
 def _ask_int(prompt: str, default: int, minimum: int = 1) -> int:
@@ -654,10 +736,9 @@ def interactive(
         seed = int(seed_raw)
     except ValueError:
         seed = -1
-    if seed == -1:
-        import random
-
-        seed = random.randint(0, 18446744073709551615)
+    random_seed = seed == -1
+    if random_seed:
+        seed = _draw_seed()
     while True:
         prompt = _ask("Prompt")
         if prompt.strip():
@@ -681,7 +762,47 @@ def interactive(
         vae_model=vae_model,
         use_tiled_vae=use_tiled_vae,
         tile_size=tile_size,
+        random_seed=random_seed,
     )
+
+
+def _settings_summary(settings: GenerationSettings) -> str:
+    seed = "random" if settings.random_seed else str(settings.seed)
+    tiled = f"on (tile {settings.tile_size})" if settings.use_tiled_vae else "off"
+    return (
+        f"{settings.model}, {settings.width}x{settings.height}, steps {settings.steps}, "
+        f"cfg {settings.cfg:g}, {settings.sampler}/{settings.scheduler}, "
+        f"tiled VAE {tiled}, seed: {seed}"
+    )
+
+
+def interactive_round(previous: GenerationSettings) -> GenerationSettings:
+    """Ask only what changes between rounds: count and the two prompts.
+
+    Everything else (model, size, steps, cfg, sampler/scheduler, VAE settings)
+    is reused from ``previous``. An empty answer keeps the previous value, so
+    pressing Enter through the block reproduces the last round. A round that
+    started from a random seed draws a new one: same prompt and same seed would
+    otherwise write the same images again.
+    """
+    print("\n--- Next round (same settings) ---")
+    print(_settings_summary(previous))
+    count = _ask_int("Number of images", previous.count)
+    prompt = _ask_reuse("positive prompt", previous.prompt)
+    neg_prompt = _ask_reuse("negative prompt", previous.neg_prompt)
+    seed = _draw_seed() if previous.random_seed else previous.seed
+    return dataclass_replace(
+        previous,
+        count=count,
+        prompt=prompt,
+        neg_prompt=neg_prompt,
+        seed=seed,
+    )
+
+
+def _report_progress(elapsed_s: int) -> None:
+    """Repaint the elapsed-time ticker on the terminal, never in the log."""
+    write_private(f"\rGenerating… {elapsed_s}s elapsed")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -722,25 +843,40 @@ def main(argv: list[str] | None = None) -> int:
         settings = dataclass_replace(settings, model=model_names[0])
 
     client = ComfyUIClient(api_url)
-    try:
-        saved = run_generation(
-            client,
-            settings,
-            output_dir,
-            progress_callback=lambda secs: print(f"\rGenerating… {secs}s elapsed", end="", flush=True),
-        )
-    except (RuntimeError, TimeoutError, ValueError) as exc:
-        print()
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
+    total: list[GeneratedImage] = []
+    round_no = 1
+    while True:
+        try:
+            saved = run_generation(
+                client,
+                settings,
+                output_dir,
+                progress_callback=_report_progress,
+            )
+        except (RuntimeError, TimeoutError, ValueError) as exc:
+            write_private("\n")
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
-    print()
-    if not saved:
-        print(f"ERROR: No images were generated to {output_dir}", file=sys.stderr)
-        return 1
-    print(f"\nGenerated {len(saved)} image(s) to {output_dir}:")
-    for img in saved:
-        print(f"  {img.path}")
+        # Terminate the repaint on the terminal only: it was never logged.
+        write_private("\n")
+        if not saved:
+            print(f"ERROR: No images were generated to {output_dir}", file=sys.stderr)
+            return 1
+        total.extend(saved)
+        print(f"\nRound {round_no}: generated {len(saved)} image(s) to {output_dir}:")
+        for img in saved:
+            print(f"  {img.path}")
+
+        # The ComfyUI server is stopped by generate.sh, i.e. only after this
+        # loop ends: further rounds reuse the loaded model and VAE.
+        if not _ask_yn("Generate more images with the same settings?", default=False):
+            break
+        settings = interactive_round(settings)
+        round_no += 1
+
+    if round_no > 1:
+        print(f"\nTotal: {len(total)} image(s) to {output_dir}")
     return 0
 
 
