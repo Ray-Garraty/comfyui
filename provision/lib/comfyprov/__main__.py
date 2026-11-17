@@ -13,7 +13,7 @@ import json
 import sys
 from pathlib import Path
 
-from . import auth, checks, crashlog, models, report
+from . import auth, checks, crashlog, models, report, vitals
 from . import facts as facts_module
 from . import plan as plan_module
 from . import verify as verify_module
@@ -62,6 +62,19 @@ def _build_parser() -> argparse.ArgumentParser:
     doctor_cmd.add_argument("--json", action="store_true")
 
     sub.add_parser("snapshot", help="print a one-shot memory/GPU state snapshot for the logs")
+
+    vitals_cmd = sub.add_parser("vitals", help="record host/GPU vitals until the watched process ends")
+    vitals_cmd.add_argument("--out", default=None, help="log file (default: <LOG_DIR>/vitals.log)")
+    vitals_cmd.add_argument("--pid", type=int, default=None, help="stop when this process disappears")
+    vitals_cmd.add_argument("--interval", type=float, default=None, help="seconds between samples")
+    vitals_cmd.add_argument("--max-mb", type=int, default=None, help="rotate the log at this size")
+    vitals_cmd.add_argument(
+        "--guard-avail-mb",
+        type=int,
+        default=None,
+        help="stop the watched process when MemAvailable drops below this",
+    )
+    vitals_cmd.add_argument("--once", action="store_true", help="print one sample and exit")
 
     verify_cmd = sub.add_parser("verify", help="check a running ComfyUI")
     verify_cmd.add_argument("--url", required=True)
@@ -175,6 +188,26 @@ def _cmd_doctor(args) -> int:
 def _cmd_snapshot(_args) -> int:
     print(crashlog.snapshot(Probe()))
     return EXIT_OK
+
+
+def _cmd_vitals(args) -> int:
+    """Second-by-second black box for a machine that stops without a message."""
+    config = _load(args)
+    if args.once:
+        now, fields = vitals.sample(Probe(), pid=args.pid)
+        print(vitals.format_sample(now, fields))
+        return EXIT_OK
+    out = Path(args.out) if args.out else config.log_dir / "vitals.log"
+    interval = config.vitals_interval if args.interval is None else args.interval
+    max_mb = config.vitals_max_mb if args.max_mb is None else args.max_mb
+    guard = config.vitals_guard_avail_mb if args.guard_avail_mb is None else args.guard_avail_mb
+    return vitals.run(
+        out,
+        interval=interval,
+        pid=args.pid,
+        max_bytes=max(1, max_mb) * vitals.MB,
+        guard_avail_mb=guard,
+    )
 
 
 def _cmd_verify(args) -> int:
@@ -335,6 +368,7 @@ _HANDLERS = {
     "preflight": _cmd_preflight,
     "doctor": _cmd_doctor,
     "snapshot": _cmd_snapshot,
+    "vitals": _cmd_vitals,
     "verify": _cmd_verify,
     "gpucheck": _cmd_gpucheck,
     "auth": _cmd_auth,

@@ -270,6 +270,12 @@ fi
 if [[ "$LOWVRAM" == "1" ]]; then
     CMD+=(--lowvram)
 fi
+# ComfyUI is allowed to pin ~27 GiB of this 32 GiB box as staging buffers for
+# the async weight offload (comfy/model_management.py: ram - 4 GiB). Turning it
+# off costs throughput and removes the largest single host-memory consumer.
+if [[ "${COMFYUI_DISABLE_PINNED_MEMORY:-0}" == "1" ]]; then
+    CMD+=(--disable-pinned-memory)
+fi
 if [[ "$CPU_ONLY" == "1" ]]; then
     CMD+=(--cpu)
 fi
@@ -289,6 +295,7 @@ printf '  Output:     %s\n' "$OUTPUT_DIR"
 printf '  Log file:   %s\n' "$LOG_FILE"
 if [[ "$LOWVRAM" == "1" ]]; then printf '  Mode:       lowvram\n'; fi
 if [[ "$CPU_ONLY" == "1" ]]; then printf '  Mode:       CPU only\n'; fi
+if [[ "${COMFYUI_DISABLE_PINNED_MEMORY:-0}" == "1" ]]; then printf '  Pinning:    disabled\n'; fi
 printf '\n'
 
 if [[ "$DRY_RUN" == "1" ]]; then
@@ -334,6 +341,25 @@ fi
 # tmpfs and loses everything on a hard reset). Mirror it into the log dir.
 if [[ ! -t 1 ]]; then
     exec > >(tee -a "$SERVER_LOG") 2>&1
+fi
+
+# ---------------------------------------------------------------------------
+# Black box: one line per second until this process exits
+# ---------------------------------------------------------------------------
+# The machine has stopped executing with no kernel message at all, so the only
+# evidence that can survive is state that was already on the platter. The
+# recorder watches this PID (the launcher becomes the server via exec) and
+# writes host memory, PSI, allocator stalls, GPU VRAM/GTT/clocks/power and the
+# server's own PSS/swap. It also trips the guard below when memory runs out.
+VITALS_LOG="$LOG_DIR/vitals.log"
+if [[ "${COMFYUI_VITALS:-1}" == "1" ]]; then
+    VITALS_ARGS=(--out "$VITALS_LOG" --pid "$$")
+    if [[ -n "${VITALS_INTERVAL:-}" ]]; then VITALS_ARGS+=(--interval "$VITALS_INTERVAL"); fi
+    if [[ -n "${VITALS_MAX_MB:-}" ]]; then VITALS_ARGS+=(--max-mb "$VITALS_MAX_MB"); fi
+    if [[ -n "${VITALS_GUARD_AVAIL_MB:-}" ]]; then VITALS_ARGS+=(--guard-avail-mb "$VITALS_GUARD_AVAIL_MB"); fi
+    log "Vitals: $VITALS_LOG (${VITALS_INTERVAL:-1}s, guard ${VITALS_GUARD_AVAIL_MB:-0} MiB)"
+    py vitals "${VITALS_ARGS[@]}" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
 fi
 
 # Force the log files to disk every few seconds: the page cache is exactly what

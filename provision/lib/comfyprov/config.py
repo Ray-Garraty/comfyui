@@ -289,6 +289,27 @@ class Config:
         raw = self.get("COMFYUI_EXTRA_ARGS", "")
         return tuple(part for part in raw.split() if part)
 
+    # -- black box -----------------------------------------------------------
+    @property
+    def comfyui_vitals(self) -> bool:
+        return self.boolean("COMFYUI_VITALS", True)
+
+    @property
+    def vitals_interval(self) -> float:
+        return self.number("VITALS_INTERVAL", 1.0)
+
+    @property
+    def vitals_max_mb(self) -> int:
+        return self.integer("VITALS_MAX_MB", 8)
+
+    @property
+    def vitals_guard_avail_mb(self) -> int:
+        return self.integer("VITALS_GUARD_AVAIL_MB", 1024)
+
+    @property
+    def comfyui_disable_pinned_memory(self) -> bool:
+        return self.boolean("COMFYUI_DISABLE_PINNED_MEMORY", False)
+
     # -- behaviour -----------------------------------------------------------
     @property
     def install_manager(self) -> bool:
