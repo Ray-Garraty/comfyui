@@ -313,11 +313,15 @@ def configured_host(config, accessible: bool = True, session_groups=("vlabe", "r
 
 
 # -- image fixtures ----------------------------------------------------------
-def png_bytes(width: int, height: int, gradient: bool = False, level: int = 9) -> bytes:
+def png_bytes(
+    width: int, height: int, gradient: bool = False, level: int = 9, text: dict[str, str] | None = None
+) -> bytes:
     """A valid 8-bit RGB PNG built with zlib only.
 
     ``gradient=False`` produces a uniform (blank) frame: a valid file with no
     content, which is exactly what the output validator has to reject.
+    ``text`` adds tEXt chunks (key -> value), the place where ComfyUI stores the
+    API prompt and the workflow; privacy tests need them.
     """
     import struct
     import zlib
@@ -334,10 +338,15 @@ def png_bytes(width: int, height: int, gradient: bool = False, level: int = 9) -
     def chunk(tag: bytes, payload: bytes) -> bytes:
         return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", zlib.crc32(tag + payload))
 
+    text_chunks = b"".join(
+        chunk(b"tEXt", key.encode("latin-1") + b"\x00" + value.encode("utf-8")) for key, value in (text or {}).items()
+    )
+
     header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
     return (
         b"\x89PNG\r\n\x1a\n"
         + chunk(b"IHDR", header)
+        + text_chunks
         + chunk(b"IDAT", zlib.compress(bytes(raw), level))
         + chunk(b"IEND", b"")
     )

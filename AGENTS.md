@@ -192,7 +192,8 @@ Important values:
   every `all` run; ComfyUI may pin up to 16 GiB of host memory.
 - `COMFYUI_LOG_LEVEL=INFO`, `COMFYUI_DEBUG_LOG=1` (second DEBUG log file),
   `LOG_SYNC_INTERVAL=5` (seconds between `sync -f` calls on the log files),
-  `ENABLE_CRASH_CAPTURE=1` (journald/rsyslog/watchdog/pstore step).
+  `ENABLE_CRASH_CAPTURE=1` (journald/rsyslog/watchdog/pstore step),
+  `COMFYUI_DISABLE_METADATA=1` (no prompt/workflow in saved files).
 - `TORCH_VERSION=2.13.0`, `TORCHVISION_VERSION=0.28.0`,
   `TORCHAUDIO_VERSION=2.11.0.2`, `ROCM_VERSION=10.1.0`, index
   `https://stable.repo.amd.com/rocm/whl-next/`.
@@ -228,9 +229,20 @@ Runtime (user level, no sudo):
 - `py snapshot` (`comfyprov.crashlog.snapshot`) prints RSS/swap/load plus
   `mem_info_vram_*` and `mem_info_gtt_*`; the launcher and the generator append
   it to their logs at start and at exit.
-- User prompts and the once-per-second `Generating…` repaint are terminal-only
-  (`comfyprov.generate.write_private`): `logs/generate.log` records phases,
-  timings, produced paths and host state, never prompt text or the ticker.
+- User prompts are private. They never reach a log or a generated file:
+  prompts and the once-per-second `Generating…` repaint are terminal-only
+  (`comfyprov.generate.write_private`); echoes of raw user input (a prompt
+  typed into "Number of images") are shown on the terminal and logged without
+  the value (`write_split`); every prompt is registered with
+  `LogTee.add_sensitive`, so an error body that quotes the workflow is
+  `[redacted]` before it is written. `logs/generate.log` records phases,
+  timings, produced paths and host state only.
+- Images carry no metadata: `start-comfyui.sh` and the temporary server in
+  `verify` pass `--disable-metadata` (ComfyUI otherwise writes the API prompt
+  and the whole workflow into PNG tEXt chunks), and the generator strips
+  `tEXt`/`zTXt`/`iTXt`/`eXIf` chunks before saving. `smoke.validate_outputs`
+  rejects any PNG that still has them, and `test_generate_e2e.py` asserts the
+  prompt is absent from the files and from every log line of the run.
 - `start-comfyui.sh` and `generate.sh` run a `sync -f <log files>` loop every
   `LOG_SYNC_INTERVAL` seconds; the loop exits when its parent process is gone.
 - `PYTHONFAULTHANDLER=1` is exported so a native crash prints a traceback.

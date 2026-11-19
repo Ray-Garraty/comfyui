@@ -230,6 +230,10 @@ cmd_verify() {
         [[ -n "$port" ]] || die "No free port for the temporary ComfyUI instance."
         url="http://127.0.0.1:$port"
         log "Starting a temporary ComfyUI instance on $url"
+        local metadata_args=()
+        if [[ "${COMFYUI_DISABLE_METADATA:-1}" == "1" ]]; then
+            metadata_args+=(--disable-metadata)
+        fi
         (
             cd "$COMFYUI_DIR"
             exec "$VENV_DIR/bin/python" main.py \
@@ -242,6 +246,7 @@ cmd_verify() {
                 --user-directory "$USER_DIR" \
                 --reserve-vram "${COMFYUI_RESERVE_VRAM}" \
                 --disable-auto-launch \
+                ${metadata_args[@]+"${metadata_args[@]}"} \
                 --verbose INFO "$log_file"
         ) >>"$console_log" 2>&1 &
         srv_pid=$!

@@ -310,6 +310,10 @@ class Config:
     def comfyui_disable_pinned_memory(self) -> bool:
         return self.boolean("COMFYUI_DISABLE_PINNED_MEMORY", False)
 
+    @property
+    def comfyui_disable_metadata(self) -> bool:
+        return self.boolean("COMFYUI_DISABLE_METADATA", True)
+
     # -- behaviour -----------------------------------------------------------
     @property
     def install_manager(self) -> bool:
@@ -421,6 +425,7 @@ def validate(config: Config) -> None:
 
     config.boolean("COMFYUI_LOWVRAM")
     config.boolean("COMFYUI_DEBUG_LOG")
+    config.boolean("COMFYUI_DISABLE_METADATA", True)
     config.boolean("INSTALL_MANAGER")
     config.boolean("CREATE_DESKTOP_ICON")
     config.boolean("ENABLE_CRASH_CAPTURE")

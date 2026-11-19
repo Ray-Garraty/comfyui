@@ -22,6 +22,7 @@ environment, not the other way round).
 
 from __future__ import annotations
 
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -68,6 +69,45 @@ class LauncherPythonPathTests(unittest.TestCase):
             "PYTHONPATH must be exported before the server starts, otherwise the child "
             "process runs without sitecustomize and int8 models fail on hipblasLt",
         )
+
+
+class LauncherPromptMetadataTests(unittest.TestCase):
+    """Prompts are private: no generated file may carry them.
+
+    ComfyUI writes the API prompt and the whole workflow into PNG tEXt chunks
+    unless ``--disable-metadata`` is passed. The launcher must pass it, and the
+    temporary server started by ``verify`` must pass it too.
+    """
+
+    def _dry_run(self, **overrides: str) -> subprocess.CompletedProcess[str]:
+        env = {key: value for key, value in os.environ.items() if key != "COMFYUI_DISABLE_METADATA"}
+        env.update(overrides)
+        return subprocess.run(
+            [str(START_SH), "--dry-run", "--no-browser", "--no-mount"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+            env=env,
+        )
+
+    def test_launcher_passes_disable_metadata_by_default(self) -> None:
+        result = self._dry_run()
+        self.assertEqual(result.returncode, 0, result.stderr[-1500:])
+        self.assertIn("--disable-metadata", result.stdout)
+        self.assertIn("Metadata:   disabled", result.stdout)
+
+    def test_metadata_can_still_be_enabled_explicitly(self) -> None:
+        result = self._dry_run(COMFYUI_DISABLE_METADATA="0")
+        self.assertEqual(result.returncode, 0, result.stderr[-1500:])
+        self.assertNotIn("--disable-metadata", result.stdout)
+        self.assertNotIn("Metadata:   disabled", result.stdout)
+
+    def test_verify_starts_its_temporary_server_without_metadata(self) -> None:
+        text = (INSTALL_DIR / "provision.sh").read_text(encoding="utf-8")
+        self.assertIn("COMFYUI_DISABLE_METADATA", text)
+        self.assertIn("--disable-metadata", text)
+        self.assertIn('"${metadata_args[@]}"', text, "the verify server must receive the flag")
 
 
 if __name__ == "__main__":

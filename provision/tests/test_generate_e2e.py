@@ -31,12 +31,16 @@ from pathlib import Path
 
 import pytest
 
-from comfyprov.smoke import validate_outputs
+from comfyprov.smoke import png_text_chunks, validate_outputs
 
 INSTALL_DIR = Path(__file__).resolve().parents[2]
 GENERATE_SH = INSTALL_DIR / "generate.sh"
 OUTPUT_DIR = INSTALL_DIR / "output"
 LOG_DIR = INSTALL_DIR / "logs"
+
+# The prompt typed by this test. It is private user content: it must not appear
+# in any log or inside any produced file.
+PROMPT = "a cute cat"
 
 
 def _tail(path: Path, lines: int = 40) -> str:
@@ -45,6 +49,38 @@ def _tail(path: Path, lines: int = 40) -> str:
     except OSError:
         return f"<{path}: unreadable>"
     return "\n".join(content[-lines:])
+
+
+def _log_sizes() -> dict[Path, int]:
+    sizes: dict[Path, int] = {}
+    for path in LOG_DIR.glob("*.log"):
+        try:
+            sizes[path] = path.stat().st_size
+        except OSError:
+            sizes[path] = 0
+    return sizes
+
+
+def _prompt_leaks(before: dict[Path, int]) -> dict[str, str]:
+    """Log files (or just their new lines) that contain the prompt.
+
+    ``generate.log`` is truncated at every run, so it is checked as a whole.
+    The other logs are append-only and only the new bytes belong to this run;
+    reading from the old size keeps an old leak from failing a clean one.
+    """
+    leaks: dict[str, str] = {}
+    for path in LOG_DIR.glob("*.log"):
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if path.name == "generate.log":
+            text = data.decode("utf-8", errors="replace")
+        else:
+            text = data[before.get(path, 0) :].decode("utf-8", errors="replace")
+        if PROMPT in text:
+            leaks[path.name] = text
+    return leaks
 
 
 def _diagnostics() -> str:
@@ -58,7 +94,7 @@ def _diagnostics() -> str:
 # cfg, sampler, scheduler, seed, prompt, negative prompt, and finally whether to
 # generate another round ("n"). The EOF right after it is an answer too, but
 # saying "n" explicitly keeps the round contract under test.
-ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", "a cute cat", "", "n"]) + "\n"
+ANSWERS = "\n".join(["1", "1", "1", "512x512", "1", "4", "1.0", "1", "1", "-1", PROMPT, "", "n"]) + "\n"
 
 
 @pytest.mark.e2e
@@ -70,6 +106,7 @@ def test_generate_sh_produces_a_non_blank_image() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     before = set(OUTPUT_DIR.iterdir())
+    logs_before = _log_sizes()
 
     env = os.environ.copy()
     # The script must establish this itself; see the module docstring.
@@ -95,6 +132,21 @@ def test_generate_sh_produces_a_non_blank_image() -> None:
 
     problems = validate_outputs([str(image) for image in created])
     assert not problems, "generator produced unusable images:\n  " + "\n  ".join(problems) + _diagnostics()
+
+    # Privacy contract: the prompt is the user's private business. It must not
+    # be embedded in the produced files and must not survive in any log.
+    for image in created:
+        chunks = png_text_chunks(image.read_bytes())
+        assert not chunks, f"{image.name} embeds prompt metadata: {chunks}{_diagnostics()}"
+
+    leaks = _prompt_leaks(logs_before)
+    assert not leaks, (
+        "the prompt leaked into the logs: "
+        + ", ".join(sorted(leaks))
+        + "\n"
+        + "\n".join(f"--- {name} ---\n{text}" for name, text in leaks.items())
+        + _diagnostics()
+    )
 
     # The int8 patches only work when the launcher exports comfy_kitchen_config;
     # without them the run fails on hipblasLt, so this is the behavioural proof

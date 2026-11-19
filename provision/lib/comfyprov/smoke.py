@@ -181,18 +181,106 @@ def check_image(path: str) -> tuple[bool, str]:
         return False, f"PIL failed: {exc}"
 
 
+# Chunks that can carry free text: PNG tEXt/zTXt/iTXt are exactly where ComfyUI
+# stores the API prompt and the full workflow, and eXIf can hold an
+# ImageDescription/XPComment written by other tools.
+TEXT_CHUNKS = frozenset({b"tEXt", b"zTXt", b"iTXt", b"eXIf"})
+
+
+def png_text_chunks(data: bytes) -> list[str]:
+    """Names of the text-capable chunks present in a PNG, in file order."""
+    if not data.startswith(PNG_MAGIC):
+        return []
+    names: list[str] = []
+    pos = 8
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        end = pos + 12 + length
+        if end > len(data):
+            break
+        chunk_type = data[pos + 4 : pos + 8]
+        if chunk_type in TEXT_CHUNKS:
+            names.append(chunk_type.decode("latin-1"))
+        pos = end
+    return names
+
+
+def strip_png_text_chunks(data: bytes) -> bytes:
+    """Drop text-capable chunks, leaving pixels and structure untouched.
+
+    The server is started with ``--disable-metadata``, but it may have been
+    started before that flag existed (or by hand). Stripping here means a
+    prompt can never reach the output directory through the generator, even
+    then. Non-PNG payloads are returned unchanged.
+    """
+    if not data.startswith(PNG_MAGIC):
+        return data
+    out = bytearray(PNG_MAGIC)
+    pos = 8
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        end = pos + 12 + length
+        if end > len(data):
+            # Truncated file: leave it as-is and let check_image reject it.
+            return data
+        if data[pos + 4 : pos + 8] not in TEXT_CHUNKS:
+            out += data[pos:end]
+        pos = end
+    if pos != len(data):
+        # Trailing or missing bytes: never turn a broken file into a shorter one.
+        return data
+    return bytes(out)
+
+
+def strip_text_metadata(path: str) -> list[str]:
+    """Remove text-capable chunks from a PNG on disk, in place.
+
+    Returns the chunk names that were removed (empty when there was nothing to
+    do or the file could not be rewritten). Used by the smoke generation, which
+    may run against a server that was started without ``--disable-metadata``.
+    """
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return []
+    chunks = png_text_chunks(data)
+    if not chunks:
+        return []
+    stripped = strip_png_text_chunks(data)
+    if stripped == data:
+        return []
+    try:
+        with open(path, "wb") as handle:
+            handle.write(stripped)
+    except OSError:
+        return []
+    return chunks
+
+
 def validate_outputs(paths) -> list[str]:
     """Problems found in the produced files: blank frames, unreadable files.
 
     The generator and the e2e test share this check, so "an image exists" can
     never be confused with "an image was produced": a 512x512 PNG of pure black
-    is a valid file and worthless output.
+    is a valid file and worthless output. Prompt text is a problem too: the
+    prompt is private and must never travel inside a generated file.
     """
     problems: list[str] = []
     for path in paths:
         ok, detail = check_image(str(path))
         if not ok:
             problems.append(f"{path}: {detail}")
+            continue
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError as exc:
+            problems.append(f"{path}: {exc}")
+            continue
+        chunks = png_text_chunks(data)
+        if chunks:
+            problems.append(f"{path}: embeds prompt metadata ({', '.join(chunks)})")
     return problems
 
 
@@ -248,6 +336,11 @@ def run_generation(
         path = os.path.join(output_dir, image.get("subfolder") or "", image.get("filename") or "")
         ok, detail = check_image(path)
         if ok:
+            # The prompt is private even in the smoke workflow: do not leave it
+            # in the output when the server was started without --disable-metadata.
+            removed = strip_text_metadata(path)
+            if removed:
+                progress(f"{path}: removed text metadata ({', '.join(removed)})")
             progress(f"{path} ({detail})")
         else:
             failures.append(f"{path}: {detail}")

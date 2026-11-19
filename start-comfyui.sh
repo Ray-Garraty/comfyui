@@ -47,7 +47,8 @@ Options:
   --dry-run         Show the final command instead of running it
   -h, --help        Show this help
 
-Environment overrides: COMFYUI_PORT, COMFYUI_LOWVRAM, COMFYUI_RESERVE_VRAM.
+Environment overrides: COMFYUI_PORT, COMFYUI_LOWVRAM, COMFYUI_RESERVE_VRAM,
+                      COMFYUI_DISABLE_METADATA (1 keeps prompts out of the files).
 EOF
 }
 
@@ -276,6 +277,11 @@ fi
 if [[ "${COMFYUI_DISABLE_PINNED_MEMORY:-0}" == "1" ]]; then
     CMD+=(--disable-pinned-memory)
 fi
+# Prompts are private. Without this ComfyUI writes the API prompt and the whole
+# workflow into the PNG tEXt chunks of every saved image.
+if [[ "${COMFYUI_DISABLE_METADATA:-1}" == "1" ]]; then
+    CMD+=(--disable-metadata)
+fi
 if [[ "$CPU_ONLY" == "1" ]]; then
     CMD+=(--cpu)
 fi
@@ -296,6 +302,7 @@ printf '  Log file:   %s\n' "$LOG_FILE"
 if [[ "$LOWVRAM" == "1" ]]; then printf '  Mode:       lowvram\n'; fi
 if [[ "$CPU_ONLY" == "1" ]]; then printf '  Mode:       CPU only\n'; fi
 if [[ "${COMFYUI_DISABLE_PINNED_MEMORY:-0}" == "1" ]]; then printf '  Pinning:    disabled\n'; fi
+if [[ "${COMFYUI_DISABLE_METADATA:-1}" == "1" ]]; then printf '  Metadata:   disabled (no prompt in generated files)\n'; fi
 printf '\n'
 
 if [[ "$DRY_RUN" == "1" ]]; then

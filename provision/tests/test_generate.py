@@ -23,21 +23,28 @@ from comfyprov.generate import (
     GeneratedImage,
     GenerationSettings,
     LogTee,
+    _ask_float,
+    _ask_int,
     _ask_yn,
     _extract_float,
     _extract_int,
     _extract_str,
     _parse_png_parameters,
     _report_progress,
+    _select_from_list,
+    _settings_summary,
     build_workflow,
     discover_models,
     import_metadata,
     interactive,
     interactive_round,
     main,
+    register_private_text,
     run_generation,
     write_private,
+    write_split,
 )
+from comfyprov.smoke import png_text_chunks
 
 # ---------------------------------------------------------------------------
 # PNG parameter parsing
@@ -313,6 +320,30 @@ class TestRunGeneration(unittest.TestCase):
             self.assertTrue(out_file.is_file())
             self.assertEqual(out_file.read_bytes(), fake.download_image.return_value)
 
+    def test_downloaded_prompt_metadata_is_stripped(self) -> None:
+        """A server started without --disable-metadata must not leak a prompt."""
+        settings = _settings(prompt="a private cat")
+        fake = mock.Mock(spec=ComfyUIClient)
+        fake.queue_prompt.return_value = "p1"
+        fake.wait_for_completion.return_value = {
+            "7": {"images": [{"filename": "0001.png", "subfolder": "", "type": "output"}]}
+        }
+        fake.download_image.return_value = png_bytes(
+            64,
+            64,
+            gradient=True,
+            text={"prompt": '{"4": {"inputs": {"text": "a private cat"}}}', "workflow": "{}"},
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            run_generation(fake, settings, tmp)
+            data = (Path(tmp) / "0001.png").read_bytes()
+
+        self.assertEqual(png_text_chunks(data), [])
+        self.assertNotIn(b"private cat", data)
+        # Only the metadata changed: the pixels are identical to a clean PNG.
+        self.assertEqual(data, png_bytes(64, 64, gradient=True))
+
     def test_blank_image_is_an_error(self) -> None:
         """A black 512x512 PNG is a valid file and worthless output."""
         settings = GenerationSettings(
@@ -431,8 +462,8 @@ class TestInteractive(unittest.TestCase):
                 "1",
                 "4",
                 "1.0",
-                "euler",
-                "simple",
+                "1",
+                "1",
                 "1",
                 "",  # empty prompt -> must retry
                 "  ",  # whitespace-only prompt -> must retry
@@ -583,6 +614,161 @@ class TestProgressOutput(unittest.TestCase):
         self.assertEqual(stream.getvalue(), "plain\n")
 
 
+# ---------------------------------------------------------------------------
+# Prompt privacy: logs must not persist prompts or mistyped input
+# ---------------------------------------------------------------------------
+
+
+class TestLogRedaction(unittest.TestCase):
+    SECRET = "a private photo of a grey cat"
+
+    def _tee(self) -> tuple[LogTee, io.StringIO, io.StringIO]:
+        terminal, log = io.StringIO(), io.StringIO()
+        return LogTee(terminal, log), terminal, log
+
+    def test_registered_prompts_are_redacted_from_the_log(self) -> None:
+        tee, terminal, log = self._tee()
+        tee.add_sensitive(self.SECRET)
+        with mock.patch("sys.stdout", tee):
+            print(f"queueing: {self.SECRET}")
+        self.assertIn(self.SECRET, terminal.getvalue())
+        self.assertNotIn("grey cat", log.getvalue())
+        self.assertIn("[redacted]", log.getvalue())
+
+    def test_redaction_also_covers_tracebacks_and_multiline_text(self) -> None:
+        tee, _terminal, log = self._tee()
+        tee.add_sensitive(self.SECRET)
+        with mock.patch("sys.stdout", tee):
+            print(f"Traceback:\n  RuntimeError: could not queue {self.SECRET}\n")
+        self.assertNotIn("grey cat", log.getvalue())
+
+    def test_the_longest_secret_is_replaced_first(self) -> None:
+        tee, _terminal, log = self._tee()
+        tee.add_sensitive("private", "a private cat")
+        with mock.patch("sys.stdout", tee):
+            print("a private cat")
+        self.assertIn("[redacted]", log.getvalue())
+        self.assertNotIn("private cat", log.getvalue())
+
+    def test_blank_secrets_are_ignored(self) -> None:
+        tee, _terminal, log = self._tee()
+        tee.add_sensitive("", "   ")
+        with mock.patch("sys.stdout", tee):
+            print("nothing secret")
+        self.assertIn("nothing secret", log.getvalue())
+
+    def test_write_split_keeps_user_input_out_of_the_log(self) -> None:
+        tee, terminal, log = self._tee()
+        with mock.patch("sys.stdout", tee):
+            write_split("Invalid value 'a cat', using 1\n", "Invalid value, using 1\n")
+        self.assertIn("a cat", terminal.getvalue())
+        self.assertIn("Invalid value, using 1", log.getvalue())
+        self.assertNotIn("'a cat'", log.getvalue())
+
+    def test_write_split_without_a_tee_still_shows_the_text(self) -> None:
+        stream = io.StringIO()
+        with mock.patch("sys.stdout", stream):
+            write_split("raw\n", "safe\n")
+        self.assertEqual(stream.getvalue(), "raw\n")
+
+    def test_register_private_text_without_a_tee_is_harmless(self) -> None:
+        stream = io.StringIO()
+        with mock.patch("sys.stdout", stream):
+            register_private_text("a cat")
+        self.assertEqual(stream.getvalue(), "")
+
+
+class TestMistypedInputPrivacy(unittest.TestCase):
+    """A prompt typed into the wrong field is user data too."""
+
+    def _tee(self) -> tuple[LogTee, io.StringIO, io.StringIO]:
+        terminal, log = io.StringIO(), io.StringIO()
+        return LogTee(terminal, log), terminal, log
+
+    def test_prompt_typed_instead_of_the_image_count_is_not_logged(self) -> None:
+        tee, terminal, log = self._tee()
+        answers = iter(["1", "1", "1", "512x512", "a private cat", "4", "1.0", "1", "1", "7", "a dog", ""])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            settings = interactive(
+                available_models=["model.safetensors"],
+                available_clip_models=["clip.safetensors"],
+                available_vae_models=["vae.safetensors"],
+            )
+        self.assertEqual(settings.count, 1)
+        self.assertIn("a private cat", terminal.getvalue())
+        self.assertNotIn("private cat", log.getvalue())
+        self.assertNotIn("a dog", log.getvalue(), "the real prompt must stay out as well")
+
+    def test_prompt_typed_instead_of_the_image_size_is_not_logged(self) -> None:
+        tee, _terminal, log = self._tee()
+        answers = iter(["1", "1", "1", "a private cat", "1", "4", "1.0", "1", "1", "7", "a dog", ""])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            settings = interactive(
+                available_models=["model.safetensors"],
+                available_clip_models=["clip.safetensors"],
+                available_vae_models=["vae.safetensors"],
+            )
+        self.assertEqual((settings.width, settings.height), (1024, 1024))
+        self.assertNotIn("private cat", log.getvalue())
+
+    def test_prompt_typed_instead_of_a_list_number_is_not_logged(self) -> None:
+        tee, terminal, log = self._tee()
+        answers = iter(["a private cat", "1"])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            selected = _select_from_list("Models", ["model.safetensors"])
+        self.assertEqual(selected, "model.safetensors")
+        self.assertIn("a private cat", terminal.getvalue())
+        self.assertNotIn("private cat", log.getvalue())
+
+    def test_prompt_typed_instead_of_yes_no_is_not_logged(self) -> None:
+        tee, _terminal, log = self._tee()
+        answers = iter(["a private cat", "n"])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            self.assertFalse(_ask_yn("Generate more images?"))
+        self.assertNotIn("private cat", log.getvalue())
+
+    def test_invalid_numbers_and_floats_are_logged_without_the_value(self) -> None:
+        tee, _terminal, log = self._tee()
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", return_value="a private cat"):
+            self.assertEqual(_ask_int("Count", 3), 3)
+            self.assertEqual(_ask_float("CFG", 1.0), 1.0)
+        self.assertNotIn("private cat", log.getvalue())
+        self.assertEqual(log.getvalue().count("Invalid value, using"), 2)
+
+    def test_the_settings_summary_never_contains_a_prompt(self) -> None:
+        summary = _settings_summary(_settings(prompt="a private cat", neg_prompt="ugly private dog"))
+        self.assertNotIn("private", summary)
+        self.assertIn("model.safetensors", summary)
+
+    def test_interactive_round_registers_the_new_prompts_for_redaction(self) -> None:
+        tee, _terminal, log = self._tee()
+        previous = _settings(prompt="old private cat")
+        answers = iter(["", "new private dog", ""])
+        with mock.patch("sys.stdout", tee), mock.patch("builtins.input", lambda _: next(answers)):
+            interactive_round(previous)
+            print("error while queueing new private dog")
+        self.assertNotIn("private dog", log.getvalue())
+        self.assertIn("[redacted]", log.getvalue())
+
+
+class TestNoFreeFormFileNames(unittest.TestCase):
+    """A typed sentence must never become a model name sent to the server.
+
+    ComfyUI answers ``value_not_in_list`` for an unknown checkpoint and logs the
+    received value, which would persist the prompt in ``comfyui.log``.
+    """
+
+    def test_empty_selection_list_is_an_error(self) -> None:
+        with self.assertRaises(ValueError):
+            _select_from_list("Available generative models on disk", [])
+
+    def test_empty_model_directory_fails_before_reading_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch("builtins.input") as ask:
+            rc = main(["http://127.0.0.1:8188", tmp, tmp, "", ""])
+        self.assertEqual(rc, 1)
+        ask.assert_not_called()
+
+
 class TestMainRounds(unittest.TestCase):
     ARGV: ClassVar[list[str]] = ["http://127.0.0.1:8188", "/tmp/out", "", "", ""]
 
@@ -637,6 +823,26 @@ class TestMainRounds(unittest.TestCase):
         ):
             self.assertEqual(main(self.ARGV), 1)
         ask_more.assert_not_called()
+
+    def test_error_messages_are_redacted_before_they_reach_the_log(self) -> None:
+        """An error body can echo the workflow: the log must not keep it."""
+        first = _settings(prompt="a private cat", neg_prompt="ugly private dog")
+        terminal, log = io.StringIO(), io.StringIO()
+        tee = LogTee(terminal, log)
+        error = RuntimeError("HTTP 400: node 4 rejected text 'a private cat' / 'ugly private dog'")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch("sys.stdout", tee),
+            mock.patch("sys.stderr", tee),
+            mock.patch("comfyprov.generate.interactive", return_value=first),
+            mock.patch("comfyprov.generate.run_generation", side_effect=error),
+            mock.patch("comfyprov.generate._ask_yn"),
+        ):
+            self.assertEqual(main(self.ARGV), 1)
+        self.assertIn("a private cat", terminal.getvalue(), "the terminal may show the real error")
+        self.assertNotIn("private cat", log.getvalue())
+        self.assertNotIn("private dog", log.getvalue())
+        self.assertIn("[redacted]", log.getvalue())
 
 
 if __name__ == "__main__":

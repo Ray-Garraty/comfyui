@@ -28,7 +28,7 @@ from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any
 
-from .smoke import check_image
+from .smoke import check_image, strip_png_text_chunks
 
 # ---------------------------------------------------------------------------
 # Output: terminal + log file without interactive latency
@@ -36,6 +36,9 @@ from .smoke import check_image
 
 # Same format as the shell helpers in generate.sh: date '+%Y-%m-%d %H:%M:%S'.
 LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# What replaces a prompt in the log if it ever ends up in a message.
+REDACTED = "[redacted]"
 
 
 class LogTee(io.TextIOBase):
@@ -51,6 +54,12 @@ class LogTee(io.TextIOBase):
       forks ``date`` per line) used to block Python's ``write()`` right after
       Enter.
 
+    Privacy rule: prompts are the user's private business. The log is a
+    diagnostic artefact that outlives the session, so prompt text must never
+    reach it. Values registered with :meth:`add_sensitive` are redacted from
+    every line written to the log, and :meth:`write_split` lets a caller show
+    raw user input on the terminal while logging only a sanitized version.
+
     The wrapped stream stays owned by the interpreter: :meth:`close` only
     detaches, it never closes the terminal.
     """
@@ -61,6 +70,7 @@ class LogTee(io.TextIOBase):
         self._time_format = time_format
         self._at_line_start = True
         self._lock = threading.Lock()
+        self._sensitive: tuple[str, ...] = ()
 
     # -- text stream protocol -------------------------------------------
     def write(self, text: str) -> int:
@@ -85,6 +95,33 @@ class LogTee(io.TextIOBase):
             self._stream.write(text)
             self._stream.flush()
         return len(text)
+
+    def write_split(self, terminal_text: str, log_text: str) -> int:
+        """Show ``terminal_text`` and log only ``log_text``.
+
+        Diagnostics about user input ("Invalid value 'a cat', using 1") must
+        echo what was typed on the terminal while the persisted log keeps a
+        version without the user's data ("Invalid value, using 1").
+        """
+        if not terminal_text and not log_text:
+            return 0
+        with self._lock:
+            self._stream.write(terminal_text)
+            self._stream.flush()
+            self._write_log(log_text)
+        return len(terminal_text)
+
+    def add_sensitive(self, *values: str) -> None:
+        """Register strings that must never appear in the log.
+
+        Defence in depth: prompt text is written with :func:`write_private` and
+        error messages are sanitized, but an unexpected traceback must not be
+        able to persist a prompt either. Longer values are replaced first so an
+        overlapping pair cannot leave a visible remainder.
+        """
+        with self._lock:
+            merged = {value for value in (*self._sensitive, *values) if value and value.strip()}
+            self._sensitive = tuple(sorted(merged, key=len, reverse=True))
 
     def flush(self) -> None:
         with self._lock:
@@ -129,6 +166,12 @@ class LogTee(io.TextIOBase):
         return getattr(self._stream, "errors", None)  # type: ignore[no-any-return]
 
     # -- logging ---------------------------------------------------------
+    def _redact(self, text: str) -> str:
+        for secret in self._sensitive:
+            if secret in text:
+                text = text.replace(secret, REDACTED)
+        return text
+
     def _write_log(self, text: str) -> None:
         """Append ``text`` to the log, prefixing each new line with a timestamp.
 
@@ -137,6 +180,7 @@ class LogTee(io.TextIOBase):
         """
         if self._log is None:
             return
+        text = self._redact(text)
         try:
             for index, chunk in enumerate(text.split("\n")):
                 if index:
@@ -190,6 +234,30 @@ def write_private(text: str) -> None:
         return
     stream.write(text)
     stream.flush()
+
+
+def write_split(terminal_text: str, log_text: str) -> None:
+    """Echo user input on the terminal and keep it out of the log.
+
+    Used by every diagnostic that would otherwise repeat what the user typed
+    into the wrong field ("Invalid value 'a cat', using 1"). The terminal sees
+    the raw input because it is already on the screen; the log gets
+    ``log_text``, which says what happened without repeating the data.
+    """
+    stream = sys.stdout
+    split = getattr(stream, "write_split", None)
+    if callable(split):
+        split(terminal_text, log_text)
+        return
+    stream.write(terminal_text)
+    stream.flush()
+
+
+def register_private_text(*values: str) -> None:
+    """Feed prompt strings to the log tee so they can never be persisted."""
+    add = getattr(sys.stdout, "add_sensitive", None)
+    if callable(add):
+        add(*values)
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +590,11 @@ def run_generation(
                 subfolder = img.get("subfolder", "")
                 ftype = img.get("type", "output")
                 data = client.download_image(filename, subfolder, ftype)
+                # The server runs with --disable-metadata, but a stale instance
+                # (started before that flag, or by hand) would still embed the
+                # prompt. Strip it here so no prompt can reach the output.
                 out_path = out_dir / filename
-                out_path.write_bytes(data)
+                out_path.write_bytes(strip_png_text_chunks(data))
                 ok, detail = check_image(str(out_path))
                 if not ok:
                     # A 512x512 PNG of pure black is a valid file and no image:
@@ -575,7 +646,10 @@ def _ask_yn(question: str, default: bool = False) -> bool:
             return True
         if answer in ("n", "no"):
             return False
-        print(f"Invalid answer '{raw}', expected 'y' or 'n'")
+        write_split(
+            f"Invalid answer '{raw}', expected 'y' or 'n'\n",
+            "Invalid answer, expected 'y' or 'n'\n",
+        )
 
 
 def _ask_reuse(label: str, previous: str) -> str:
@@ -597,7 +671,7 @@ def _ask_int(prompt: str, default: int, minimum: int = 1) -> int:
         try:
             value = int(raw)
         except ValueError:
-            print(f"Invalid value '{raw}', using {default}")
+            write_split(f"Invalid value '{raw}', using {default}\n", f"Invalid value, using {default}\n")
             return default
         if value < minimum:
             print(f"Value must be >= {minimum}, using {default}")
@@ -611,12 +685,19 @@ def _ask_float(prompt: str, default: float) -> float:
         try:
             return float(raw)
         except ValueError:
-            print(f"Invalid value '{raw}', using {default}")
+            write_split(f"Invalid value '{raw}', using {default}\n", f"Invalid value, using {default}\n")
             return default
 
 
 def _select_from_list(title: str, options: list[str], default_index: int = 1) -> str:
-    """Show a numbered list and return the selected option."""
+    """Show a numbered list and return the selected option.
+
+    Only a number is accepted. Returning arbitrary text used to look like a
+    convenience for advanced users, but a mistyped prompt then became a model
+    name, reached the server and was echoed back in its error log.
+    """
+    if not options:
+        raise ValueError(f"no candidates for {title.lower()}; check the model directories")
     print(f"\n{title}:")
     print("------------------------------------")
     for i, name in enumerate(options, start=1):
@@ -630,10 +711,10 @@ def _select_from_list(title: str, options: list[str], default_index: int = 1) ->
             return options[default_index - 1]
         if sel.isdigit() and 1 <= int(sel) <= len(options):
             return options[int(sel) - 1]
-        # Allow free-form input for advanced users.
-        if sel:
-            return sel
-        print(f"Invalid selection. Enter a number between 1 and {len(options)}.")
+        write_split(
+            f"Invalid selection '{sel}', enter a number between 1 and {len(options)}.\n",
+            f"Invalid selection, enter a number between 1 and {len(options)}.\n",
+        )
 
 
 # Common ComfyUI samplers / schedulers (safe defaults for MOSS Image).
@@ -694,17 +775,17 @@ def interactive(
     clip_model = settings_source.clip_model if settings_source else ""
     vae_model = settings_source.vae_model if settings_source else ""
 
-    if available_models:
+    if available_models is not None:
         model = _select_from_list("Available generative models on disk", available_models, 1)
     else:
         model = _ask("Model", model) or model
 
-    if available_clip_models:
+    if available_clip_models is not None:
         clip_model = _select_from_list("Text encoders (CLIP)", available_clip_models, 1)
     else:
         clip_model = _ask("Text encoder (CLIP) model", clip_model) or clip_model
 
-    if available_vae_models:
+    if available_vae_models is not None:
         vae_model = _select_from_list("VAE models", available_vae_models, 1)
     else:
         vae_model = _ask("VAE model", vae_model) or vae_model
@@ -714,7 +795,10 @@ def interactive(
         width_s, height_s = size_raw.split("x")
         width, height = int(width_s), int(height_s)
     except ValueError:
-        print(f"Invalid size '{size_raw}', using {width}x{height}")
+        write_split(
+            f"Invalid size '{size_raw}', using {width}x{height}\n",
+            f"Invalid size, using {width}x{height}\n",
+        )
     count = _ask_int("Number of images", count)
     # Images are generated one-by-one to minimise peak VRAM usage on RDNA2.
     steps = _ask_int("Steps", steps)
@@ -745,6 +829,8 @@ def interactive(
             break
         print("Prompt cannot be empty")
     neg_prompt = _ask("Negative prompt")
+
+    register_private_text(prompt, neg_prompt)
 
     return GenerationSettings(
         model=model,
@@ -790,6 +876,7 @@ def interactive_round(previous: GenerationSettings) -> GenerationSettings:
     count = _ask_int("Number of images", previous.count)
     prompt = _ask_reuse("positive prompt", previous.prompt)
     neg_prompt = _ask_reuse("negative prompt", previous.neg_prompt)
+    register_private_text(prompt, neg_prompt)
     seed = _draw_seed() if previous.random_seed else previous.seed
     return dataclass_replace(
         previous,
@@ -832,11 +919,17 @@ def main(argv: list[str] | None = None) -> int:
     available_clip_models = discover_models(clip_dir) if clip_dir else None
     available_vae_models = discover_models(vae_dir) if vae_dir else None
 
-    settings = interactive(
-        available_models=available_models,
-        available_clip_models=available_clip_models,
-        available_vae_models=available_vae_models,
-    )
+    try:
+        settings = interactive(
+            available_models=available_models,
+            available_clip_models=available_clip_models,
+            available_vae_models=available_vae_models,
+        )
+    except ValueError as exc:
+        # An empty model directory is a setup problem, not a prompt: fail before
+        # asking anything (a free-form answer there would become a file name).
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
     # Override model with explicit name from argv if provided
     if model_names:
@@ -846,6 +939,7 @@ def main(argv: list[str] | None = None) -> int:
     total: list[GeneratedImage] = []
     round_no = 1
     while True:
+        register_private_text(settings.prompt, settings.neg_prompt)
         try:
             saved = run_generation(
                 client,

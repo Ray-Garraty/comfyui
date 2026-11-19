@@ -17,7 +17,14 @@ from tempfile import TemporaryDirectory
 
 from helpers import png_bytes
 
-from comfyprov.smoke import check_image, png_extrema, validate_outputs
+from comfyprov.smoke import (
+    check_image,
+    png_extrema,
+    png_text_chunks,
+    strip_png_text_chunks,
+    strip_text_metadata,
+    validate_outputs,
+)
 
 
 class PngExtremaTests(unittest.TestCase):
@@ -88,6 +95,73 @@ class ValidateOutputsTests(unittest.TestCase):
             good = Path(tmp) / "good.png"
             good.write_bytes(png_bytes(64, 64, gradient=True))
             self.assertEqual(validate_outputs([str(good)]), [])
+
+
+class PngTextChunkTests(unittest.TestCase):
+    """A prompt is private: it must never sit inside a generated PNG."""
+
+    PROMPT = "a studio photo of a secret cat"
+
+    def test_text_chunks_are_detected(self) -> None:
+        data = png_bytes(32, 32, gradient=True, text={"prompt": self.PROMPT})
+        self.assertEqual(png_text_chunks(data), ["tEXt"])
+
+    def test_plain_png_has_no_text_chunks(self) -> None:
+        self.assertEqual(png_text_chunks(png_bytes(32, 32, gradient=True)), [])
+
+    def test_non_png_is_ignored(self) -> None:
+        self.assertEqual(png_text_chunks(b"not a png"), [])
+        self.assertEqual(strip_png_text_chunks(b"not a png"), b"not a png")
+
+    def test_strip_removes_prompt_and_keeps_the_pixels(self) -> None:
+        data = png_bytes(
+            32,
+            32,
+            gradient=True,
+            text={"prompt": self.PROMPT, "workflow": '{"1": {}}', "parameters": self.PROMPT},
+        )
+        stripped = strip_png_text_chunks(data)
+        self.assertEqual(png_text_chunks(stripped), [])
+        self.assertNotIn(b"secret cat", stripped)
+        # Nothing else changed: IHDR/IDAT/IEND are byte-identical to a clean PNG.
+        self.assertEqual(stripped, png_bytes(32, 32, gradient=True))
+
+    def test_strip_of_a_clean_png_is_a_no_op(self) -> None:
+        data = png_bytes(32, 32, gradient=True)
+        self.assertEqual(strip_png_text_chunks(data), data)
+
+    def test_strip_leaves_a_truncated_file_alone(self) -> None:
+        data = png_bytes(32, 32, gradient=True, text={"prompt": self.PROMPT})
+        truncated = data[:16]
+        self.assertEqual(strip_png_text_chunks(truncated), truncated)
+
+    def test_validate_outputs_rejects_embedded_prompts(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "leaky.png"
+            path.write_bytes(png_bytes(64, 64, gradient=True, text={"prompt": self.PROMPT}))
+            problems = validate_outputs([str(path)])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("leaky.png", problems[0])
+        self.assertIn("prompt metadata", problems[0])
+        self.assertNotIn(self.PROMPT, problems[0], "the report must not repeat the prompt")
+
+    def test_strip_text_metadata_cleans_a_file_in_place(self) -> None:
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "smoke.png"
+            path.write_bytes(png_bytes(64, 64, gradient=True, text={"prompt": self.PROMPT}))
+            removed = strip_text_metadata(str(path))
+            self.assertEqual(removed, ["tEXt"])
+            self.assertEqual(path.read_bytes(), png_bytes(64, 64, gradient=True))
+            self.assertEqual(strip_text_metadata(str(path)), [], "second pass has nothing to do")
+
+    def test_strip_text_metadata_tolerates_missing_and_broken_files(self) -> None:
+        with TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "missing.png")
+            self.assertEqual(strip_text_metadata(missing), [])
+            broken = Path(tmp) / "broken.png"
+            broken.write_bytes(b"not a png")
+            self.assertEqual(strip_text_metadata(str(broken)), [])
+            self.assertEqual(broken.read_bytes(), b"not a png")
 
 
 if __name__ == "__main__":

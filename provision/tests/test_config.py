@@ -82,6 +82,10 @@ class RealConfigTests(unittest.TestCase):
         with self.assertRaises(config.ConfigError):
             config.load(environ={"COMFYUI_LISTEN": "0.0.0.0"})
 
+    def test_prompt_metadata_is_disabled_by_default(self) -> None:
+        self.assertTrue(config.load().comfyui_disable_metadata)
+        self.assertFalse(config.load(environ={"COMFYUI_DISABLE_METADATA": "0"}).comfyui_disable_metadata)
+
 
 if __name__ == "__main__":
     unittest.main()
